@@ -478,6 +478,11 @@ void main(uint3 id : SV_DispatchThreadID) {
                 // CPU writes and reads of the whole buffer, where it can be mapped
                 let mut p: *mut c_void = std::ptr::null_mut();
                 if buf.Map(0, None, Some(&mut p)).is_ok() && !p.is_null() {
+                    // where the mapping is, and what VirtualQuery knows of it (under Wine: whether Wine's
+                    // allocator placed it)
+                    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                    VirtualQuery(p, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>());
+                    row += &format!("  at {p:?} (state {:#x}, type {:#x}, allocation {:?})", m.State, m.Type, m.AllocationBase);
                     let t0 = std::time::Instant::now();
                     std::ptr::write_bytes(p as *mut u8, 1, SIZE);
                     let w = t0.elapsed();
