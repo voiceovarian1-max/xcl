@@ -5794,6 +5794,18 @@ mod tests {
     /// with no new tile mapping (cleared instead). One that is not is unmapped and freed by
     /// `flush_parked` (before a submit), or when the free list runs out; a placed buffer's
     /// release does not free it while it is parked.
+    /// Until every fence the quarantined tiles wait for has reached its mark (5 s at most each).
+    unsafe fn wait_quarantined(s: &State) {
+        for batch in &s.quarantined {
+            for (f, v) in batch.marks.iter().flatten() {
+                let t0 = std::time::Instant::now();
+                while f.GetCompletedValue() < *v && t0.elapsed().as_secs() < 5 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_tile_decommitted_and_committed_again_keeps_its_video_memory() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -5928,6 +5940,8 @@ mod tests {
             assert!(s.value > v, "the unmapping is sent");
             assert!(!s.flush_parked(), "nothing left to flush");
             s.wait_for(s.value);
+            // (and the title queues other tests made, whose fences the quarantine waits for too)
+            wait_quarantined(&s);
             assert!(s.drain_quarantined());
             assert!(s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile));
 
@@ -5947,6 +5961,8 @@ mod tests {
             assert!(s.flush_parked());
             assert!(!s.cooling.iter().any(|c| c.0 == parked), "unmapped at the flush, quarantined");
             s.wait_for(s.value);
+            // (and the title queues other tests made, whose fences the quarantine waits for too)
+            wait_quarantined(&s);
             assert!(s.drain_quarantined());
             assert_eq!(s.cooling.back().map(|c| c.0), Some(parked), "unmapped at the flush, then cooling");
 
@@ -5984,6 +6000,8 @@ mod tests {
             assert!(s.kept.is_empty() && !s.cooling.iter().any(|c| c.0 == tile));
             assert!(s.flush_parked());
             s.wait_for(s.value);
+            // (and the title queues other tests made, whose fences the quarantine waits for too)
+            wait_quarantined(&s);
             assert!(s.drain_quarantined());
             assert!(s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile));
 
@@ -6014,6 +6032,8 @@ mod tests {
             s.flush_pending();
 
             s.wait_for(s.value);
+            // (and the title queues other tests made, whose fences the quarantine waits for too)
+            wait_quarantined(&s);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
