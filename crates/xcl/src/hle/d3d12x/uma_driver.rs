@@ -400,13 +400,19 @@ void main(uint3 id : SV_DispatchThreadID) {
             if let Some(b) = imported(MEM_WRITE_WATCH) {
                 homes.push(("imported, write watch", b));
             }
-            for (name, flags) in [("CUSTOM L0 write-back", D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS), ("CUSTOM L0 write-back, write watch", D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH)] {
+            // (CUSTOM L1 write-combine: under vkd3d-proton DEVICE_LOCAL | HOST_VISIBLE, video memory the
+            // CPU maps through the BAR)
+            for (name, flags, page, pool) in [
+                ("CUSTOM L0 write-back", D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0),
+                ("CUSTOM L0 write-back, write watch", D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0),
+                ("CUSTOM L1 write-combine", D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L1),
+            ] {
                 let desc = D3D12_HEAP_DESC {
                     SizeInBytes: SIZE as u64,
                     Properties: D3D12_HEAP_PROPERTIES {
                         Type: D3D12_HEAP_TYPE_CUSTOM,
-                        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-                        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                        CPUPageProperty: page,
+                        MemoryPoolPreference: pool,
                         ..Default::default()
                     },
                     Alignment: 0x1_0000,
@@ -468,6 +474,19 @@ void main(uint3 id : SV_DispatchThreadID) {
                         cell.push(format!("{best:.1}"));
                     }
                     row += &format!("  {boxes:>5} boxes {:>8} / {:<8}", cell[0], cell[1]);
+                }
+                // CPU writes and reads of the whole buffer, where it can be mapped
+                let mut p: *mut c_void = std::ptr::null_mut();
+                if buf.Map(0, None, Some(&mut p)).is_ok() && !p.is_null() {
+                    let t0 = std::time::Instant::now();
+                    std::ptr::write_bytes(p as *mut u8, 1, SIZE);
+                    let w = t0.elapsed();
+                    let t1 = std::time::Instant::now();
+                    let sum: u64 = std::slice::from_raw_parts(p as *const u64, SIZE / 8).iter().fold(0u64, |a, &v| a.wrapping_add(v));
+                    let r = t1.elapsed();
+                    std::hint::black_box(sum);
+                    buf.Unmap(0, None);
+                    row += &format!("  CPU write {:.2} GB/s, read {:.3} GB/s", SIZE as f64 / w.as_secs_f64() / 1e9, SIZE as f64 / r.as_secs_f64() / 1e9);
                 }
                 eprintln!("{row}");
             }
