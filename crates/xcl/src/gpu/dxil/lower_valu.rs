@@ -1561,7 +1561,9 @@ mod fidelity_tests {
         };
         let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
 
-        // Uniform s_barrier: every wave executes it -> Direct DXIL accepts & validates.
+        // Uniform s_barrier: every wave executes it. On nvidia-dev the direct DXIL path refuses any
+        // s_barrier in a group of several hardware waves (`barrier_waves`, lower.rs), so this one
+        // falls back to HLSL too.
         let uniform: Vec<u8> = [
             ("S_BARRIER", "ENC_SOPP", &[][..], None),
             ("S_ENDPGM", "ENC_SOPP", &[], None),
@@ -1569,8 +1571,8 @@ mod fidelity_tests {
         .iter()
         .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
         .collect();
-        let ku = translate_mesh(&uniform, o, &ms).expect("uniform MS barrier");
-        validate::validate(&ku.dxil).expect("uniform MS DXIL validate");
+        let err = translate_mesh(&uniform, o, &ms).err().expect("a multi-wave MS barrier falls back on nvidia-dev");
+        assert!(err.contains("s_barrier in a group of several hardware waves"), "unexpected error: {err}");
 
         // Early-exit s_endpgm bypassing s_barrier in a multi-wave MS -> rejected so caller uses HLSL xcl_s_barrier().
         let non_uniform: Vec<u8> = [
