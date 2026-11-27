@@ -1404,7 +1404,7 @@ fn start_look_ahead() {
             let mut buf: Vec<*mut c_void> = vec![std::ptr::null_mut(); 16384];
             let (mut rounds, mut pages, mut us, mut longest) = (0u64, 0u64, 0u64, 0u64);
             loop {
-                std::thread::sleep(pause);
+                crate::util::nap(pause);
                 if now_us().saturating_sub(LAST_SUBMIT.load(Ordering::Relaxed)) > 200_000 {
                     continue;
                 }

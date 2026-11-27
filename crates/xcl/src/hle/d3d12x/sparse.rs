@@ -2745,7 +2745,7 @@ fn start_readback_thread() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_micros(500));
+            crate::util::nap(std::time::Duration::from_micros(500));
             // (`XCL_SUBMIT_LOCK_FIRST=1`: nothing to land, or a submit waits for the lock: not now)
             if submit_lock_first() && (RB_PENDING.load(Ordering::Acquire) == 0 || SUBMITS_WAITING.load(Ordering::Acquire) > 0) {
                 continue;
@@ -3273,7 +3273,7 @@ fn pending_soon() {
                     g = PENDING_WAKE.1.wait(g).unwrap_or_else(|e| e.into_inner());
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            crate::util::nap(std::time::Duration::from_millis(2));
             if PENDING.load(Ordering::Acquire) {
                 send_pending();
             }

@@ -132,6 +132,32 @@ pub fn under_wine() -> bool {
     })
 }
 
+/// Sleep for `d` on a background loop of XCL's own. Under Wine a non-alertable
+/// `NtDelayExecution` is a sleep inside the process, while `std::thread::sleep` makes and closes
+/// a high-resolution waitable timer at each call (wineserver requests); elsewhere it is
+/// `std::thread::sleep`.
+pub fn nap(d: std::time::Duration) {
+    type DelayFn = unsafe extern "system" fn(u8, *const i64) -> i32;
+    static DELAY: std::sync::OnceLock<Option<DelayFn>> = std::sync::OnceLock::new();
+    let delay = *DELAY.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        if !under_wine() {
+            return None;
+        }
+        // SAFETY: ntdll is always loaded; the name is NUL-terminated; the signature is NtDelayExecution's
+        unsafe { GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"NtDelayExecution".as_ptr() as *const u8).map(|f| std::mem::transmute::<_, DelayFn>(f)) }
+    });
+    match delay {
+        Some(f) => {
+            // relative time, in 100 ns units
+            let t = -((d.as_nanos() / 100).max(1).min(i64::MAX as u128) as i64);
+            // SAFETY: `t` outlives the call
+            unsafe { f(0, &t) };
+        }
+        None => std::thread::sleep(d),
+    }
+}
+
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
 pub fn dll_key(name: &str) -> String {
     let base = name.rsplit(['\\', '/']).next().unwrap_or(name);
@@ -319,6 +345,25 @@ unsafe impl Sync for SendPtr {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_nap_sleeps_at_least_as_long_as_asked() {
+        for us in [300u64, 500, 2000] {
+            let d = std::time::Duration::from_micros(us);
+            let t0 = std::time::Instant::now();
+            for _ in 0..20 {
+                super::nap(d);
+            }
+            let each = t0.elapsed() / 20;
+            assert!(each >= d, "{us} us asked, {each:?} slept");
+            // (a measurement, not a bound: how far over the asked time a nap goes here)
+            let t1 = std::time::Instant::now();
+            for _ in 0..20 {
+                std::thread::sleep(d);
+            }
+            eprintln!("nap {us} us: {each:?} each; std::thread::sleep: {:?} each", t1.elapsed() / 20);
+        }
+    }
+
     use super::*;
 
     #[test]
