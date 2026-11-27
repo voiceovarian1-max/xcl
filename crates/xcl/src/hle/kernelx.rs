@@ -594,6 +594,17 @@ pub mod mirrors {
         source(va).map_or(Shows::NoView, Shows::Same)
     }
 
+    // PORT-CHECK: our #1055 copy's API kept for `d3d12x::list_x::copy_title_range`; HEAD's `shows` answers it
+    /// (local) `shows` as the older page-mapping record answered: `Some(Some(a))` – `va` shows the
+    /// bytes at `a`, `Some(None)` – nothing, `None` – the method never named that page.
+    pub fn mapped_source(va: usize) -> Option<Option<usize>> {
+        match shows(va) {
+            Shows::Page { at, .. } => Some(Some(at)),
+            Shows::Nothing => Some(None),
+            Shows::Same(_) | Shows::NoView => None,
+        }
+    }
+
     /// The first and the last 64 KiB page of `[va, va + len)` (`len` 0: one byte).
     fn span(va: usize, len: usize) -> (usize, usize) {
         (va & !(PAGE - 1), va.saturating_add(len.max(1) - 1) & !(PAGE - 1))

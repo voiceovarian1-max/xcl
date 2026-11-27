@@ -1570,12 +1570,43 @@ fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
 static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
-/// stride = element size, num_records in elements); empty when the buffer is not in UMA. A
+/// stride = element size, num_records in elements); mirrored into UMA if outside it. A
 /// buffer placed in a GPU view asks for the tiles of the range viewed (`view_want`).
 fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
-    let Some((at, bytes)) = console_buffer(res) else {
-        note_buffer_view();
-        return [0; 4];
+    let (at, bytes) = match console_buffer(res) {
+        Some(b) => b,
+        None => {
+            let addr = title_address(res);
+            let desc_bytes = title_buffer_bytes(res).or_else(|| {
+                if res != 0 && crate::gpu::shader::readable(res, 8) {
+                    let res_ptr = res as *mut c_void;
+                    unsafe { ID3D12Resource::from_raw_borrowed(&res_ptr).map(|r| r.GetDesc().Width as usize) }
+                } else {
+                    None
+                }
+            });
+            match (addr, desc_bytes) {
+                (Some(va), Some(bytes)) if bytes > 0 => {
+                    // (a view window: shaders read it there, `view_want` asks for its tiles)
+                    let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va) || u.is_view(va));
+                    if in_uma {
+                        (va, bytes)
+                    } else {
+                        match unsafe { super::list_x::mirror_of(va as u64, bytes, "buffer view") } {
+                            Some(m) => (m, bytes),
+                            None => {
+                                note_buffer_view();
+                                return [0; 4];
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    note_buffer_view();
+                    return [0; 4];
+                }
+            }
+        }
     };
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
     let (stride, elem) = if raw {
@@ -2012,6 +2043,16 @@ pub(super) fn note_title_address(res: usize, va: usize) {
     TITLE_ADDRESS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, va);
 }
 
+static TITLE_BUFFER_BYTES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+pub(super) fn note_title_buffer_bytes(res: usize, bytes: usize) {
+    TITLE_BUFFER_BYTES.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, bytes);
+}
+
+pub(super) fn title_buffer_bytes(res: usize) -> Option<usize> {
+    TITLE_BUFFER_BYTES.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied())
+}
+
 /// resources whose Map gave their unified-memory address (no PC mapping to undo)
 static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
@@ -2329,17 +2370,24 @@ fn note_buffer_view() {
 }
 
 /// #17 CreateConstantBufferView: a V# of float4 rows at the buffer's console address
-/// (`desc::cbv_words`; unified memory, anything else gets an empty V#). No PC CBV: translated
-/// shaders read buffers through `mem`. One in a GPU view of the title's memory asks for its
-/// tiles (`view_want`).
+/// (`desc::cbv_words`; unified memory or a view window; anything else is mirrored into UMA, or
+/// gets an empty V# when it cannot be). No PC CBV: translated shaders read buffers through
+/// `mem`. One in a GPU view of the title's memory asks for its tiles (`view_want`).
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
         return f(this, desc, cpu);
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
-    let words = cbv_at(crate::gpu::uma::get(), va, size).unwrap_or_else(|| {
-        note_buffer_view();
+    let mut words = cbv_at(crate::gpu::uma::get(), va, size);
+    // (local) outside unified memory and the view windows: a mirror in unified memory
+    if words.is_none() && va != 0 && size > 0 {
+        words = super::list_x::mirror_of(va, size as usize, "CBV").map(|m| crate::gpu::desc::cbv_words(m as u64, size));
+    }
+    let words = words.unwrap_or_else(|| {
+        if va != 0 {
+            note_buffer_view();
+        }
         crate::gpu::desc::cbv_words(0, 0)
     });
     super::view_want::want(super::view_want::Path::Cbv, va, size as u64);
@@ -2795,10 +2843,16 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
         return super::console_heap::write(&slot, &[0; 8]);
     };
-    if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-        let b = &v.Anonymous.Buffer;
-        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+    let rd = r.GetDesc();
+    if desc.as_ref().map_or(rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER, |v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        let (format, first, n, stride, raw) = match desc.as_ref() {
+            Some(v) => {
+                let b = &v.Anonymous.Buffer;
+                (v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0)
+            }
+            None => (rd.Format, 0, (rd.Width / 4) as u32, 0, true),
+        };
+        return super::console_heap::write(&slot, &buffer_view(res as usize, format, first, n, stride, raw));
     }
     let rdesc = r.GetDesc();
     super::lut3d::viewed(res as usize, &rdesc, desc.as_ref(), slot.index, cpu);
@@ -2873,7 +2927,7 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         let Some(slot) = super::console_heap::slot(cpu) else { return };
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        let (words, at, len) = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        let (words, at, len) = buffer_words_at_or_mirror(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         super::view_want::want(super::view_want::Path::ViewAt, at, len);
         return super::console_heap::write(&slot, &words);
     }
@@ -2892,7 +2946,7 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let Some(slot) = super::console_heap::slot(cpu) else { return };
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        let (words, at, len) = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        let (words, at, len) = buffer_words_at_or_mirror(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         super::view_want::want(super::view_want::Path::ViewAt, at, len);
         let elem = if raw {
             4
@@ -2929,6 +2983,24 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
     let at = va + first * elem as u64;
     let len = if stride == 0 { records as u64 } else { records as u64 * stride as u64 };
     (crate::gpu::desc::buffer_words(at, stride, records, fmt), at, len)
+}
+
+/// (local) `buffer_words_at` of a buffer shaders reach where it is (unified memory, a view
+/// window), else of a mirror of it in unified memory (`list_x::mirror_of`); an empty V# when no
+/// mirror can be made.
+fn buffer_words_at_or_mirror(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> ([u32; 4], u64, u64) {
+    if crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize) || u.is_view(va as usize)) {
+        return buffer_words_at(va, format, first, n, stride, raw);
+    }
+    let (_, at, len) = buffer_words_at(va, format, first, n, stride, raw);
+    let bytes = (at - va + len) as usize;
+    if va != 0 && bytes > 0 {
+        if let Some(m) = unsafe { super::list_x::mirror_of(va, bytes, "buffer view at") } {
+            return buffer_words_at(m as u64, format, first, n, stride, raw);
+        }
+    }
+    note_buffer_view();
+    ([0; 4], 0, 0)
 }
 
 fn resolve_uav_array_size(array_size: u32, total_slices: u32, first_slice: u32) -> u32 {
@@ -10853,6 +10925,112 @@ mod wine_vtable_tests {
             let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(proxy as *const *const usize)).add(2));
             assert_eq!(release_fn(proxy), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod non_uma_buffer_view_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+    #[test]
+    fn buffer_views_outside_uma_are_mirrored() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let size = 0x2_0000;
+        let va = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(va, 0);
+        assert!(!u.contains(va), "host allocation should be outside UMA");
+
+        unsafe {
+            for i in 0..(size / 4) {
+                *((va as *mut u32).add(i)) = 0xAA00_0000 | i as u32;
+            }
+        }
+
+        let fake_res = 0xdead_beef_usize;
+        note_title_address(fake_res, va);
+        note_title_buffer_bytes(fake_res, size);
+
+        // 1. Raw buffer view via buffer_view
+        let words = buffer_view(fake_res, DXGI_FORMAT_UNKNOWN, 0, (size / 4) as u32, 0, true);
+        let b = crate::gpu::desc::buffer(&words);
+        assert!(u.contains(b.address as usize), "mirrored address {:#x} should be in UMA", b.address);
+        assert_eq!(b.stride, 0);
+        assert_eq!(b.num_records, size as u32);
+        let mirrored_first_word = unsafe { *(b.address as *const u32) };
+        assert_eq!(mirrored_first_word, 0xAA00_0000);
+
+        // 2. Structured buffer view with offset
+        let words2 = buffer_view(fake_res, DXGI_FORMAT_UNKNOWN, 4, 10, 16, false);
+        let b2 = crate::gpu::desc::buffer(&words2);
+        assert_eq!(b2.address, b.address + 4 * 16);
+        assert_eq!(b2.stride, 16);
+        assert_eq!(b2.num_records, 10);
+
+        // 3. buffer_words_at_or_mirror (from dev_create_srv_at_x / dev_create_uav_at_x)
+        let (words3, _, _) = buffer_words_at_or_mirror(va as u64, DXGI_FORMAT_R32_UINT, 2, 8, 4, false);
+        let b3 = crate::gpu::desc::buffer(&words3);
+        assert!(u.contains(b3.address as usize), "buffer_words_at_or_mirror address {:#x} should be in UMA", b3.address);
+        assert_eq!(b3.address, b.address + 2 * 4);
+        assert_eq!(b3.stride, 4);
+        assert_eq!(b3.num_records, 8);
+
+        unsafe { VirtualFree(va as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn cbv_outside_uma_is_mirrored_and_refreshed() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let size = 0x1000;
+        let va = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(va, 0);
+        assert!(!u.contains(va));
+
+        unsafe {
+            *((va as *mut u32)) = 0x11223344;
+        }
+
+        let m1 = unsafe { super::super::list_x::mirror_of(va as u64, size, "CBV") }.expect("CBV mirror created");
+        assert!(u.contains(m1));
+        assert_eq!(unsafe { *(m1 as *const u32) }, 0x11223344);
+
+        // Update host memory
+        unsafe {
+            *((va as *mut u32)) = 0x55667788;
+        }
+
+        // mirror_of should refresh the mirror from the host CPU memory
+        let m2 = unsafe { super::super::list_x::mirror_of(va as u64, size, "CBV") }.expect("CBV mirror reused");
+        assert_eq!(m1, m2);
+        assert_eq!(unsafe { *(m2 as *const u32) }, 0x55667788);
+
+        unsafe { VirtualFree(va as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn uncommitted_buffer_view_does_not_crash() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        // Reserve 4 MB of memory without committing it (MEM_RESERVE only, e.g. UAV output buffer)
+        let size = 0x40_0000;
+        let va = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(va, 0);
+        assert!(!u.contains(va));
+
+        let fake_res = 0xbad_beef_usize;
+        note_title_address(fake_res, va);
+        note_title_buffer_bytes(fake_res, size);
+
+        // buffer_view on uncommitted memory should not fault (0xc0000005)
+        let words = buffer_view(fake_res, DXGI_FORMAT_UNKNOWN, 0, (size / 4) as u32, 0, true);
+        let b = crate::gpu::desc::buffer(&words);
+        assert!(u.contains(b.address as usize));
+        assert_eq!(b.num_records, size as u32);
+        // The uncommitted pages should have been safely zeroed
+        let first_word = unsafe { *(b.address as *const u32) };
+        assert_eq!(first_word, 0);
+
+        unsafe { VirtualFree(va as *mut _, 0, MEM_RELEASE) };
     }
 }
 

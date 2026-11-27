@@ -4267,26 +4267,101 @@ static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
 static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Where `[va, va + bytes)` is in a mirror, if it is in one.
-fn mirrored(va: u64, bytes: usize) -> Option<usize> {
+pub(super) fn mirrored(va: u64, bytes: usize) -> Option<usize> {
     MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
+}
+
+/// Copy `len` bytes from title memory at `src` to `dst`.
+/// Committed pages are copied; uncommitted or unreadable pages (e.g. lazy reservations
+/// or unwritten UAV output buffers) are committed if lazy, or zeroed in `dst`.
+pub(super) unsafe fn safe_copy_from_title(src: usize, dst: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    crate::hle::kernelx::lazy::ensure(src, len);
+    if crate::gpu::shader::readable(src, len) {
+        std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+        return;
+    }
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+    let mut cur = src;
+    let end = match src.checked_add(len) {
+        Some(e) => e,
+        None => return,
+    };
+    while cur < end {
+        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let n = VirtualQuery(cur as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>());
+        if n == 0 {
+            std::ptr::write_bytes((dst + (cur - src)) as *mut u8, 0, end - cur);
+            break;
+        }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize).min(end);
+        let chunk = region_end.saturating_sub(cur);
+        if chunk == 0 {
+            break;
+        }
+        let is_readable = mbi.State == MEM_COMMIT && mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && mbi.Protect != 0;
+        if is_readable {
+            std::ptr::copy_nonoverlapping(cur as *const u8, (dst + (cur - src)) as *mut u8, chunk);
+        } else {
+            std::ptr::write_bytes((dst + (cur - src)) as *mut u8, 0, chunk);
+        }
+        cur = region_end;
+    }
+}
+
+/// (local) `len` bytes of the title's memory at `va` to `dst`. In a GPU view (`kernelx::mirrors`)
+/// each 64 KiB page shows what the title put there: the page its page-mapping call named
+/// (`mapped_source`, upstream PR #1055), nothing, or else the same page of the CPU view – pages
+/// next to each other need not come from memory next to each other.
+pub(super) unsafe fn copy_title_range(va: usize, dst: usize, len: usize) {
+    use crate::hle::kernelx::mirrors;
+    if mirrors::source(va).is_none() {
+        return safe_copy_from_title(va, dst, len);
+    }
+    let (mut at, end) = (va, va.saturating_add(len));
+    while at < end {
+        let piece = ((at & !0xffff) + 0x1_0000).min(end) - at;
+        let to = dst + (at - va);
+        match mirrors::mapped_source(at) {
+            Some(Some(src)) => safe_copy_from_title(src, to, piece),
+            Some(None) => std::ptr::write_bytes(to as *mut u8, 0, piece),
+            None => safe_copy_from_title(mirrors::source(at).unwrap_or(at), to, piece),
+        }
+        at += piece;
+    }
 }
 
 /// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
 /// once) the first time.
-unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
+pub(super) unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
     if let Some(p) = mirrored(va, bytes) {
+        copy_title_range(va as usize, p, bytes);
         return Some(p);
     }
     let mut g = MIRRORS.lock().unwrap();
     // again under the lock: two lists binding one new range at once must share a mirror (a
     // second one would never be synced – every later lookup finds the first)
     if let Some(&(s, _, m)) = g.iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64) {
-        return Some(m + (va - s) as usize);
+        let p = m + (va - s) as usize;
+        copy_title_range(va as usize, p, bytes);
+        return Some(p);
     }
     let start = va & !0xffff;
     let len = ((va + bytes as u64 + 0xffff) & !0xffff) - start;
+    let src_start = crate::hle::kernelx::mirrors::source(start as usize).unwrap_or(start as usize);
+    crate::hle::kernelx::lazy::ensure(src_start, len as usize);
     // only as much as is the title's readable memory (the view itself is)
-    let (start, len) = if crate::gpu::shader::readable(start as usize, len as usize) { (start, len as usize) } else { (va, bytes) };
+    // (local) a GPU view is mirrored by whole pages, each from where it is (`copy_title_range`)
+    let in_gpu_view = crate::hle::kernelx::mirrors::source(start as usize).is_some();
+    let (start, len, src) = if in_gpu_view || crate::gpu::shader::readable(src_start, len as usize) {
+        (start, len as usize, src_start)
+    } else {
+        let src_va = crate::hle::kernelx::mirrors::source(va as usize).unwrap_or(va as usize);
+        crate::hle::kernelx::lazy::ensure(src_va, bytes);
+        (va, bytes, src_va)
+    };
     if MIRROR_BYTES.load(Ordering::Relaxed) + len as u64 > 2 << 30 {
         static FULL: AtomicBool = AtomicBool::new(false);
         if !FULL.swap(true, Ordering::Relaxed) {
@@ -4299,7 +4374,11 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
         Some((p, _)) => p,
         None => u.alloc(len, 0x1_0000)? as usize,
     };
-    std::ptr::copy_nonoverlapping(start as *const u8, p as *mut u8, len);
+    if in_gpu_view {
+        copy_title_range(start as usize, p, len);
+    } else {
+        safe_copy_from_title(src, p, len);
+    }
     g.push((start, len, p));
     let total = MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
     if g.len() <= 8 || g.len().is_power_of_two() {
@@ -4330,8 +4409,9 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
     let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
         let from = from.min(bytes as u64);
         let len = len.min(bytes as u64 - from) as usize;
-        if len > 0 && crate::gpu::shader::readable(va as usize + from as usize, len) {
-            std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
+        let src = crate::hle::kernelx::mirrors::source((va + from) as usize).unwrap_or((va + from) as usize);
+        if len > 0 {
+            safe_copy_from_title(src, mirror + from as usize, len);
         }
     };
     // the vertices read: [lo, hi)

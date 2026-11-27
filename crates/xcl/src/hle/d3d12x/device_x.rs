@@ -1180,6 +1180,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         if !buffer {
             super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
             super::lut3d::created("CreatePlacedResourceX (a resource of its own: not kept in step)", *ppv, Some(&x), Some(va as usize), false, state);
+        } else {
+            let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+            real::note_title_buffer_bytes(*ppv as usize, pc.Width as usize);
         }
     }
     if hr < 0 || once(&N, 4) {
