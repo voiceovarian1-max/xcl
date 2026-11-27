@@ -11389,8 +11389,13 @@ fn gpu_compute_lds_ring_in_a_block_of_the_programs_size() {
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && runner::split_wave64(), mem_windows: opt.mem_windows, sampler_base: 0 };
         let mut forms = vec![("HLSL", hlsl)];
         // the direct kernels `direct_or` runs: wave32, and wave64 in the split form
-        if !wave64 || runner::split_wave64() {
-            let direct = crate::gpu::dxil::kernel::translate_compute(&p, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil;
+        // (nvidia-dev's direct DXIL refuses an s_barrier in a group of several hardware waves,
+        // `barrier_waves`: such a program runs as HLSL, so only the HLSL form is checked then)
+        let direct = (!wave64 || runner::split_wave64()).then(|| crate::gpu::dxil::kernel::translate_compute(&p, o, cs)).and_then(|r| match r {
+            Err(e) if e.contains("s_barrier in a group of several hardware waves") => None,
+            r => Some(r.unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil),
+        });
+        if let Some(direct) = direct {
             let dis = crate::gpu::dxil::validate::disassemble(&direct).unwrap();
             let decl = dis.lines().find(|l| l.contains("@xcl_lds = ")).unwrap_or_else(|| panic!("{dims:?}: no xcl_lds in the direct DXIL"));
             assert!(decl.contains(&format!("[{smallest} x i32]")), "{dims:?}: the direct DXIL block is not the HLSL block's {smallest} words: {decl}");
