@@ -4589,6 +4589,7 @@ fn dummy_mesh() -> Option<&'static (Vec<u8>, Vec<u8>)> {
 pub(super) fn compile(src: &str, target: &str) -> Vec<u8> {
     unsafe {
         let mut blob = None;
+        let mut errors: Option<ID3DBlob> = None;
         let t = format!("{target}\0");
         let r = D3DCompile(
             src.as_ptr() as *const c_void,
@@ -4601,11 +4602,26 @@ pub(super) fn compile(src: &str, target: &str) -> Vec<u8> {
             0,
             0,
             &mut blob,
-            None,
+            Some(&mut errors),
         );
         match (r, blob) {
             (Ok(()), Some(b)) => std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec(),
-            _ => Vec::new(),
+            _ => {
+                // The system's HLSL compiler refused the program (Wine's own d3dcompiler does not
+                // take all of HLSL): DXC compiles it for the matching 6.0 profile.
+                let why = errors.map(|e| String::from_utf8_lossy(std::slice::from_raw_parts(e.GetBufferPointer() as *const u8, e.GetBufferSize())).trim_end_matches('\0').trim().to_string()).unwrap_or_default();
+                let profile = target.replace("_5_0", "_6_0");
+                match crate::gpu::recomp::dxc::compile(src, "main", &profile, &[]) {
+                    Ok(code) => {
+                        crate::xlog_info!("D3D12.X: D3DCompile refused a {target} program of XCL's own ({}); DXC compiled it as {profile}", why.lines().next().unwrap_or("no message"));
+                        code
+                    }
+                    Err(e) => {
+                        crate::xlog_warn!("D3D12.X: a {target} program of XCL's own does not compile: D3DCompile: {}; DXC ({profile}): {}", why.lines().next().unwrap_or("no message"), e.lines().next().unwrap_or(""));
+                        Vec::new()
+                    }
+                }
+            }
         }
     }
 }
