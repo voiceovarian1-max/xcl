@@ -1443,7 +1443,10 @@ mod tests {
             let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 0, samples_played: 0 };
             get_st(voice, &mut st, 0);
             assert_eq!({ st.buffers_queued }, 2);
-            assert_eq!({ st.current_buffer_context } as usize, CTX1);
+            // (local) Wine's XAudio2 (FAudio) names no current buffer before the voice started
+            // its first one, where XAudio2 names the next one: never our internal token
+            let cur = { st.current_buffer_context } as usize;
+            assert!(cur == CTX1 || (cur == 0 && crate::util::under_wine()), "current buffer context {cur:#x}");
 
             // Mute voice so the test runs silently on developer machines, then play to completion
             let set_vol: unsafe extern "system" fn(*mut c_void, f32, u32) -> HRESULT = std::mem::transmute(vt_v.add(12).read());
@@ -1596,7 +1599,10 @@ mod tests {
             let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 0, samples_played: 0 };
             get_st(voice, &mut st, 0);
             assert_eq!({ st.buffers_queued }, 2);
-            assert_eq!({ st.current_buffer_context } as usize, CTX_VALID);
+            // (local) Wine's XAudio2 (FAudio) names no current buffer before the voice started
+            // its first one, where XAudio2 names the next one: never our internal token
+            let cur = { st.current_buffer_context } as usize;
+            assert!(cur == CTX_VALID || (cur == 0 && crate::util::under_wine()), "current buffer context {cur:#x}");
 
             let set_vol: unsafe extern "system" fn(*mut c_void, f32, u32) -> HRESULT = std::mem::transmute(vt_v.add(12).read());
             let _ = set_vol(voice, 0.0, 0);

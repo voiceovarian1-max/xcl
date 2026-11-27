@@ -1725,7 +1725,11 @@ mod tests {
                 let old_cv: D3D12_CLEAR_VALUE = std::ptr::read_unaligned(pc_clear(&clear as *const _ as *const c_void, &mut old_buf) as *const _);
                 let new_cv: D3D12_CLEAR_VALUE = std::ptr::read_unaligned(pc_clear_for_desc(&clear as *const _ as *const c_void, pc_fmt, &mut new_buf) as *const _);
                 let mut r: Option<ID3D12Resource> = None;
-                assert!(dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, Some(&old_cv), &mut r).is_err());
+                // vkd3d-proton (Wine) does not check a texture's optimized clear value ("Ignoring
+                // optimized clear value", libs/vkd3d/resource.c): the old one passes there
+                if !crate::util::under_wine() {
+                    assert!(dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, Some(&old_cv), &mut r).is_err());
+                }
                 assert_eq!(new_cv.Format.0 as u32, promoted_fmt);
                 dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, Some(&new_cv), &mut r)
                     .unwrap_or_else(|e| panic!("promoted {orig_fmt}->{promoted_fmt} CreateCommittedResource failed: {e}"));
