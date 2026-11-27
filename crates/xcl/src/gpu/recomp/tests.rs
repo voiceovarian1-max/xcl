@@ -306,7 +306,7 @@ fn scalar_relative_move_cluster() {
     ]);
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-    assert!(t.hlsl.contains("switch (m0)") && t.hlsl.contains("switch ((m0 & 0x3FFu))") && t.hlsl.contains("switch (((m0 >> 16) & 0x3FFu))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("switch ((m0 & 0xFFu))") && t.hlsl.contains("switch (((m0 >> 16) & 0xFFu))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         direct_check(&code, &Options::default());
@@ -344,9 +344,9 @@ fn v_swaprel_b32_uses_the_m0_relative_switch() {
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
     // old VDST captured; the M0-relative register read into another temporary
     assert!(t.hlsl.contains("uint t1 = v5;"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("uint t2 = 0u; switch (m0) { case 0u: t2 = v10; break; default: break; }"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint t2 = 0u; switch ((m0 & 0xFFu)) { case 0u: t2 = v10; break; default: break; }"), "{}", t.hlsl);
     // EXEC-gated exchange of the two captured values
-    assert!(t.hlsl.contains("if (lanebit(exec_lo, exec_hi)) { v5 = t2; switch (m0) { case 0u: v10 = t1; break; default: break; } }"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("if (lanebit(exec_lo, exec_hi)) { v5 = t2; switch ((m0 & 0xFFu)) { case 0u: v10 = t1; break; default: break; } }"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         direct_check(&code, &Options::default());

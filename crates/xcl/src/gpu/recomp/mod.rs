@@ -386,19 +386,32 @@ fn fssm_shift(fssm: &[u8]) -> Option<usize> {
 
 /// One attribute of the console's PS input table (FSSM): the ISG1 register `v_interp attrN`
 /// reads and its components; `kind` 6 = a user input (0x11 seen once, for a system value).
+/// When two 16-bit ISG1 registers share one hardware attribute, `register` occupies channels
+/// `0..=1` (half-slots `0..=3`) and `hi_register` occupies channels `2..=3` (half-slots `4..=7`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PsAttr {
     pub kind: u8,
     pub register: u8,
     pub mask: u8,
     pub flat: bool,
+    pub hi_register: Option<u8>,
+    pub packed16: bool,
 }
 
-/// The PS input table of an FSSM: SPI_PS_INPUT_ENA and, per `v_interp attrN`, the register it
-/// reads. 32 records of 8 bytes at +0x130 (+ the sub-version shift): kind, register, component
-/// mask, attribute number, 0, 0, register again, 1 flat / 2 interpolated; then the record count
-/// (+0x100) and SPI_PS_INPUT_ENA (+0x110). Checked on every cached PS of three titles (472, 34,
-/// 1): consistent, and covering every attribute the code reads.
+/// Flag bit stored in [`vs_output_table`] entries whose `exp param N` carries 16-bit packed
+/// components (two 16-bit values per 32-bit export channel, optionally pairing two 16-bit
+/// OSG1 registers across channels `0..=1` and `2..=3`).
+pub const VS_PARAM_PACKED16: u32 = 1 << 16;
+
+fn is_16bit_ct(component_type: u32) -> bool {
+    matches!(component_type, 4 | 5 | 6)
+}
+
+/// The PS input table of an FSSM: SPI_PS_INPUT_ENA and, per `v_interp attrN`, the register(s)
+/// it reads. 32 records of 8 bytes at +0x130 (+ the sub-version shift): kind, register, component
+/// mask, attribute number, 0, optional paired high-half 16-bit register, packed register index,
+/// flags (`bits[1:0]`: 1 flat / 2 interpolated, `bits[4:3]`: 16-bit half-packing); then the
+/// record count (+0x100) and SPI_PS_INPUT_ENA (+0x110).
 pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
     let base = 0x130 + fssm_shift(fssm)?;
     let rd = |o: usize| fssm.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
@@ -409,19 +422,22 @@ pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
     let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let r = fssm.get(base + 8 * k..base + 8 * k + 8)?;
-        if r[3] as usize != k || r[4] != 0 || r[5] != 0 || r[6] != r[1] {
+        let mode = r[7] & 3;
+        if r[3] as usize != k || r[4] != 0 || r[6] > r[1] || mode > 2 {
             return None;
         }
-        out.push(PsAttr { kind: r[0], register: r[1], mask: r[2], flat: r[7] == 1 });
+        let packed16 = (r[7] & 0x18) != 0 || r[5] != 0;
+        let hi_register = (r[5] != 0).then_some(r[5]);
+        out.push(PsAttr { kind: r[0], register: r[1], mask: r[2], flat: mode == 1, hi_register, packed16 });
     }
     Some((ena, out))
 }
 
-/// The VS output table of an FSSM: per `exp param N`, the OSG1 register it writes. 32 records
-/// of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 0 position), register, param
-/// number, 0, 0, 0; the record count after them (+0xC0). Usually param N = the N-th output
-/// register, but not always (a Fortnite VS exports its SV_Position register as a param).
-/// Checked on every cached VS of three titles (984, 13, 1).
+/// The VS / MS output table of an FSSM: per `exp param N`, the OSG1 register it writes (plus
+/// [`VS_PARAM_PACKED16`] when 16-bit components are packed two per 32-bit export channel).
+/// 32 records of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 7 clip, 0 position),
+/// register, param number, then `[0, 0, 0]` for 32-bit params or `[register, 0, flags]` for
+/// 16-bit packed params; the record count sits after them (+0xC0).
 pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
     let base = 0x1D4 + fssm_shift(fssm)?;
     let n = fssm.get(base + 0xC0..base + 0xC4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))? as usize;
@@ -431,44 +447,168 @@ pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
     let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let r = fssm.get(base + 6 * k..base + 6 * k + 6)?;
-        if r[2] as usize != k || r[3..6] != [0, 0, 0] {
+        if r[2] as usize != k {
             return None;
         }
-        out.push(r[1] as u32);
+        if r[3..6] == [0, 0, 0] {
+            out.push(r[1] as u32);
+        } else if r[3] == r[1] && r[4] == 0 && r[5] != 0 {
+            out.push((r[1] as u32) | VS_PARAM_PACKED16);
+        } else {
+            return None;
+        }
     }
     Some(out)
 }
 
-/// The register `v_interp attr` reads: the console's table, else the attr-th distinct register.
+/// Fallback param/attribute register layout when no FSSM table is available: pairs consecutive
+/// 16-bit registers (`component_type` 4/5/6) into one packed 16-bit slot (`lo` in channels 0..1,
+/// `hi` in channels 2..3) matching the console compiler's 16-bit parameter packing.
+fn greedy_packed_slots(sig: &[SigElement], with_clip: bool) -> Vec<(u32, Option<u32>, bool)> {
+    let any_16 = ranked(sig, with_clip).iter().any(|e| is_16bit_ct(e.component_type));
+    if !any_16 {
+        return param_registers(sig, with_clip).into_iter().map(|r| (r, None, false)).collect();
+    }
+    let mut regs: Vec<(u32, bool)> = Vec::new();
+    let mut elems: Vec<&SigElement> = sig
+        .iter()
+        .filter(|e| (e.system_value == 0 && !e.name.starts_with("SV_")) || (with_clip && matches!(e.system_value, 2 | 3)))
+        .collect();
+    elems.sort_by_key(|e| e.register);
+    for e in elems {
+        if let Some(last) = regs.last_mut().filter(|(r, _)| *r == e.register) {
+            last.1 |= is_16bit_ct(e.component_type);
+        } else {
+            regs.push((e.register, is_16bit_ct(e.component_type)));
+        }
+    }
+    let mut used = vec![false; regs.len()];
+    let mut out = Vec::new();
+    for i in 0..regs.len() {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        let (r, is16) = regs[i];
+        if is16 {
+            let mut hi = None;
+            for j in (i + 1)..regs.len() {
+                if !used[j] && regs[j].1 {
+                    used[j] = true;
+                    hi = Some(regs[j].0);
+                    break;
+                }
+            }
+            out.push((r, hi, true));
+        } else {
+            out.push((r, None, false));
+        }
+    }
+    out
+}
+
+/// Register(s) and 16-bit packing flag for `exp param n`: `(lo_register, hi_register, packed16)`.
+/// When `packed16` is true, each 32-bit export channel holds two 16-bit components (`lo_register`
+/// in channels `0..=1`, optional paired `hi_register` in channels `2..=3`).
+pub fn param_slot_regs(sig: &[SigElement], table: Option<&[u32]>, n: usize) -> Option<(u32, Option<u32>, bool)> {
+    let Some(t) = table else {
+        return greedy_packed_slots(sig, true).get(n).copied();
+    };
+    let entry = *t.get(n)?;
+    let lo_reg = entry & 0xFF;
+    let packed16 = (entry & VS_PARAM_PACKED16) != 0;
+    if !packed16 {
+        return Some((lo_reg, None, false));
+    }
+    let listed: BTreeSet<u32> = t.iter().map(|&v| v & 0xFF).collect();
+    let mut unlisted_16: Vec<u32> = sig
+        .iter()
+        .filter(|e| e.system_value == 0 && !e.name.starts_with("SV_") && is_16bit_ct(e.component_type) && !listed.contains(&e.register))
+        .map(|e| e.register)
+        .collect();
+    unlisted_16.sort_unstable();
+    unlisted_16.dedup();
+    let mut cursor = 0usize;
+    let mut hi_for_n = None;
+    for (idx, &v) in t.iter().enumerate() {
+        if (v & VS_PARAM_PACKED16) == 0 {
+            continue;
+        }
+        let r = v & 0xFF;
+        let hi = if cursor < unlisted_16.len() && unlisted_16[cursor] > r {
+            let h = unlisted_16[cursor];
+            cursor += 1;
+            Some(h)
+        } else {
+            None
+        };
+        if idx == n {
+            hi_for_n = hi;
+            break;
+        }
+    }
+    Some((lo_reg, hi_for_n, true))
+}
+
+/// The register `v_interp attr` reads: the console's table, else the attr-th slot register.
 pub fn ps_attribute_register(ps: &PsInterface, attr: usize) -> Option<u32> {
     match &ps.attrs {
         Some(t) => t.get(attr).map(|a| a.register as u32),
-        None => param_registers(&ps.inputs, false).get(attr).copied(),
+        None => greedy_packed_slots(&ps.inputs, false).get(attr).map(|&(r, _, _)| r),
     }
+}
+
+/// The place in `ranked(inputs, false)` (the PC input struct's a0, a1 …) and component index
+/// (`0..=3`) to read for `v_interp_*` with `(attr, chan, high, is_f16)`. For 16-bit interpolation
+/// (`v_interp_*_f16`), `half = chan * 2 + high` selects component `0..=3` of `lo_register` when
+/// `half < 4` or component `0..=3` of a paired `hi_register` when `half >= 4`.
+pub fn ps_attribute_slot_and_comp(ps: &PsInterface, attr: usize, chan: usize, high: usize, is_f16: bool) -> Option<(usize, usize)> {
+    let (lo_reg, hi_reg, packed16) = match &ps.attrs {
+        Some(t) => {
+            let a = t.get(attr)?;
+            (a.register as u32, a.hi_register.map(u32::from), a.packed16)
+        }
+        None => greedy_packed_slots(&ps.inputs, false).get(attr).copied()?,
+    };
+    let (reg, comp) = if is_f16 {
+        let half = chan * 2 + (high & 1);
+        if half < 4 {
+            (lo_reg, half)
+        } else {
+            let _ = packed16;
+            (hi_reg?, half - 4)
+        }
+    } else {
+        (lo_reg, chan)
+    };
+    let all = ranked(&ps.inputs, false);
+    let slot = all
+        .iter()
+        .position(|e| e.register == reg && (e.mask >> comp) & 1 == 1)
+        .or_else(|| all.iter().position(|e| e.register == reg))?;
+    Some((slot, comp))
 }
 
 /// The place in `ranked(inputs, false)` (the PC input struct's a0, a1 …) to read channel `chan`
 /// of attribute `attr` from: an element at its register (the one declaring `chan`, if any).
 pub fn ps_attribute_slot(ps: &PsInterface, attr: usize, chan: usize) -> Option<usize> {
-    let r = ps_attribute_register(ps, attr)?;
-    let all = ranked(&ps.inputs, false);
-    all.iter().position(|e| e.register == r && e.mask >> chan & 1 == 1).or_else(|| all.iter().position(|e| e.register == r))
+    ps_attribute_slot_and_comp(ps, attr, chan, 0, false).map(|(slot, _)| slot)
 }
 
 /// The attribute the input at `slot` of `ranked(inputs, false)` belongs to (None: not read).
 pub fn ps_slot_attribute(ps: &PsInterface, slot: usize) -> Option<usize> {
     let r = ranked(&ps.inputs, false).get(slot)?.register;
     match &ps.attrs {
-        Some(t) => t.iter().position(|a| a.register as u32 == r),
-        None => param_registers(&ps.inputs, false).iter().position(|&x| x == r),
+        Some(t) => t.iter().position(|a| a.register as u32 == r || a.hi_register.is_some_and(|h| h as u32 == r)),
+        None => greedy_packed_slots(&ps.inputs, false).iter().position(|&(lo, hi, _)| lo == r || hi == Some(r)),
     }
 }
 
-/// The register `exp param N` of a VS writes: the console's table, else the N-th distinct one.
+/// The register `exp param N` of a VS writes: the console's table, else the N-th slot register.
 pub fn vs_param_register(vs: &VsInterface, n: usize) -> Option<u32> {
     match &vs.params {
-        Some(t) => t.get(n).copied(),
-        None => param_registers(&vs.outputs, true).get(n).copied(),
+        Some(t) => t.get(n).map(|&v| v & 0xFF),
+        None => greedy_packed_slots(&vs.outputs, true).get(n).map(|&(r, _, _)| r),
     }
 }
 
@@ -1839,5 +1979,64 @@ mod attribute_tests {
         assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
+    }
+
+    #[test]
+    fn fssm_16bit_packed_tables_and_slot_mapping() {
+        // Subver 6 PS table with paired 16-bit attr1 (r2 + r3) and r5 shifted to r[6]=4.
+        let mut fp = vec![0u8; 0x400];
+        fp[0x10..0x14].copy_from_slice(&6u32.to_le_bytes());
+        let pbase = 0x138usize;
+        fp[pbase..pbase + 24].copy_from_slice(&[
+            6, 1, 0x03, 0, 0, 0, 1, 0x02,
+            6, 2, 0x03, 1, 0, 3, 2, 0x1A,
+            6, 5, 0x0F, 2, 0, 0, 4, 0x02,
+        ]);
+        fp[pbase + 0x100] = 3;
+        fp[pbase + 0x110] = 0x02;
+        let (ena, attrs) = ps_input_table(&fp).expect("packed PS table");
+        assert_eq!(ena, 0x02);
+        assert_eq!(attrs.len(), 3);
+        assert_eq!((attrs[1].register, attrs[1].hi_register, attrs[1].packed16, attrs[1].flat), (2, Some(3), true, false));
+        let mut t1 = input("TEXCOORD", 1, 2, 7);
+        t1.component_type = 6;
+        let mut t4 = input("TEXCOORD", 4, 3, 0xF);
+        t4.component_type = 6;
+        let ps = PsInterface {
+            inputs: vec![input("TEXCOORD", 0, 1, 3), t1, t4, input("TEXCOORD", 10, 5, 0xF)],
+            attrs: Some(attrs),
+            ..Default::default()
+        };
+        assert_eq!(ps_attribute_slot_and_comp(&ps, 1, 0, 0, true), Some((1, 0)));
+        assert_eq!(ps_attribute_slot_and_comp(&ps, 1, 0, 1, true), Some((1, 1)));
+        assert_eq!(ps_attribute_slot_and_comp(&ps, 1, 1, 0, true), Some((1, 2)));
+        assert_eq!(ps_attribute_slot_and_comp(&ps, 1, 2, 0, true), Some((2, 0)));
+        assert_eq!(ps_attribute_slot_and_comp(&ps, 1, 3, 1, true), Some((2, 3)));
+        assert_eq!(ps_attribute_slot_and_comp(&ps, 2, 0, 0, false), Some((3, 0)));
+        assert_eq!((0..4).map(|j| ps_slot_attribute(&ps, j)).collect::<Vec<_>>(), [Some(0), Some(1), Some(1), Some(2)]);
+
+        // Subver 6 VS/MS table packing non-adjacent 16-bit COLOR0@r1 + TEXCOORD1@r3 into param 0.
+        let mut fv = vec![0u8; 0x400];
+        fv[0x10..0x14].copy_from_slice(&6u32.to_le_bytes());
+        let vbase = 0x1DCusize;
+        fv[vbase..vbase + 18].copy_from_slice(&[
+            6, 1, 0, 1, 0, 3,
+            6, 2, 1, 0, 0, 0,
+            6, 4, 2, 0, 0, 0,
+        ]);
+        fv[vbase + 0xC0] = 3;
+        let vt = vs_output_table(&fv).expect("packed VS table");
+        assert_eq!(vt, vec![1 | VS_PARAM_PACKED16, 2, 4]);
+        let mut c0 = input("COLOR", 0, 1, 0xF);
+        c0.component_type = 6;
+        let mut t1_out = input("TEXCOORD", 1, 3, 0xF);
+        t1_out.component_type = 6;
+        let outs = vec![c0, input("TEXCOORD", 0, 2, 3), t1_out, input("TEXCOORD", 3, 4, 0xF)];
+        assert_eq!(param_slot_regs(&outs, Some(&vt), 0), Some((1, Some(3), true)));
+        assert_eq!(param_slot_regs(&outs, Some(&vt), 1), Some((2, None, false)));
+        assert_eq!(param_slot_regs(&outs, Some(&vt), 2), Some((4, None, false)));
+        assert_eq!(param_slot_regs(&outs, None, 0), Some((1, Some(3), true)));
+        assert_eq!(param_slot_regs(&outs, None, 1), Some((2, None, false)));
+        assert_eq!(param_slot_regs(&outs, None, 2), Some((4, None, false)));
     }
 }

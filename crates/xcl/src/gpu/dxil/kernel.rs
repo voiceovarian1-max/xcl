@@ -107,6 +107,13 @@ pub fn translate_full(code: &[u8], o: KernelOptions) -> Result<Kernel, String> {
 /// A mesh-mode (NGG) program: the first pass that writes one record per group into
 /// `res` (the recompiler's `Mode::Mesh`; the pass-through mesh shader draws them).
 pub fn translate_mesh(code: &[u8], o: KernelOptions, ms: &MsInterface) -> Result<Kernel, String> {
+    let hw_wave = if o.wave64 && !o.split { 64 } else { 32 };
+    if ms.threads > hw_wave
+        && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0")
+        && super::lower::has_non_uniform_barrier(code)
+    {
+        return Err("non-uniform s_barrier in multi-wave mesh shader".into());
+    }
     translate_entry(code, o, Entry::Mesh(ms.clone()), None, None, 0)
 }
 

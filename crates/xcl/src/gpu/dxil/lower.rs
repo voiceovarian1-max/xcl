@@ -1590,6 +1590,50 @@ impl Lw {
         Ok(())
     }
 
+    /// Sound unsigned upper bound on an SSA integer `Value` (`u32::MAX` if unknown).
+    /// Walks constants, `dx.op.binary.*` `UMin`, and `phi` nodes with cycle protection.
+    pub fn value_upper_bound(&self, v: Value) -> u32 {
+        let mut seen = BTreeSet::new();
+        self.value_ub_inner(v, &mut seen, 0)
+    }
+
+    fn value_ub_inner(&self, v: Value, seen: &mut BTreeSet<u32>, depth: u32) -> u32 {
+        if let Some(c) = self.s.m.const_u64(v) {
+            return c.min(u32::MAX as u64) as u32;
+        }
+        if depth >= 16 {
+            return u32::MAX;
+        }
+        let Value::Inst(i) = v else { return u32::MAX };
+        if !seen.insert(i) {
+            return u32::MAX;
+        }
+        let res = match self.s.m.inst_info(i) {
+            super::module::InstInfo::Call(name, args)
+                if name.starts_with("dx.op.binary.")
+                    && args.len() >= 3
+                    && self.s.m.const_u64(args[0]) == Some(Binary::UMin as u64) =>
+            {
+                let a = self.value_ub_inner(args[1], seen, depth + 1);
+                let b = self.value_ub_inner(args[2], seen, depth + 1);
+                a.min(b)
+            }
+            super::module::InstInfo::Phi(list) if !list.is_empty() => {
+                let mut hi = 0u32;
+                for &(x, _) in list {
+                    hi = hi.max(self.value_ub_inner(x, seen, depth + 1));
+                    if hi == u32::MAX {
+                        break;
+                    }
+                }
+                hi
+            }
+            _ => u32::MAX,
+        };
+        seen.remove(&i);
+        res
+    }
+
     fn smovrel(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let dst = Self::field(d, "SDST");
         let src = Self::field(d, "SSRC0");
@@ -1597,41 +1641,56 @@ impl Lw {
             return err(d, "scalar movrel register");
         }
         let m0 = self.sreg(124);
+        let m0_lo = self.andc(m0, 0xFF);
         let (rd, wr, wide) = match name {
-            "s_movrels_b32" => (Some(m0), None, false),
-            "s_movrels_b64" => (Some(m0), None, true),
-            "s_movreld_b32" => (None, Some(m0), false),
-            "s_movreld_b64" => (None, Some(m0), true),
+            "s_movrels_b32" => (Some(m0_lo), None, false),
+            "s_movrels_b64" => (Some(m0_lo), None, true),
+            "s_movreld_b32" => (None, Some(m0_lo), false),
+            "s_movreld_b64" => (None, Some(m0_lo), true),
             _ => {
-                let r = self.andc(m0, 0x3FF);
                 let w = self.lshrc(m0, 16);
-                let w = self.andc(w, 0x3FF);
-                (Some(r), Some(w), false)
+                let w = self.andc(w, 0xFF);
+                (Some(m0_lo), Some(w), false)
             }
         };
         let words = if wide { 2 } else { 1 };
         let mut vals = Vec::new();
         for word in 0..words {
             if let Some(idx) = rd {
-                // select chain over every register from src + word up to s123
-                let mut v = self.c(0);
-                for k in 0..=123u64.saturating_sub(src + word) {
-                    let r = self.sreg(src + word + k);
-                    let is = self.cmpc(Pred::Eq, idx, k as u32);
-                    v = self.sel(is, r, v);
+                if let Some(k) = self.s.m.const_u64(idx) {
+                    let v = if src + word + k <= 123 { self.sreg(src + word + k) } else { self.c(0) };
+                    vals.push(v);
+                } else {
+                    let lim = 123u64.saturating_sub(src + word).min(self.value_upper_bound(idx) as u64);
+                    // select chain over every reachable register from src + word up to s123
+                    let mut v = self.c(0);
+                    for k in 0..=lim {
+                        let r = self.sreg(src + word + k);
+                        let is = self.cmpc(Pred::Eq, idx, k as u32);
+                        v = self.sel(is, r, v);
+                    }
+                    vals.push(v);
                 }
-                vals.push(v);
             } else {
                 vals.push(self.sreg(src + word));
             }
         }
         if let Some(idx) = wr {
-            for k in 0..=123u64.saturating_sub(dst + words - 1) {
-                let is = self.cmpc(Pred::Eq, idx, k as u32);
-                for w in 0..words {
-                    let old = self.sreg(dst + k + w);
-                    let v = self.sel(is, vals[w as usize], old);
-                    self.wr((dst + k + w) as u32, v);
+            if let Some(k) = self.s.m.const_u64(idx) {
+                if dst + k + words - 1 <= 123 {
+                    for w in 0..words {
+                        self.wr((dst + k + w) as u32, vals[w as usize]);
+                    }
+                }
+            } else {
+                let lim = 123u64.saturating_sub(dst + words - 1).min(self.value_upper_bound(idx) as u64);
+                for k in 0..=lim {
+                    let is = self.cmpc(Pred::Eq, idx, k as u32);
+                    for w in 0..words {
+                        let old = self.sreg(dst + k + w);
+                        let v = self.sel(is, vals[w as usize], old);
+                        self.wr((dst + k + w) as u32, v);
+                    }
                 }
             }
         } else {
@@ -2118,6 +2177,142 @@ fn fold_bin(op: BinOp, x: u64, y: u64, w: u32) -> Option<u64> {
         BinOp::URem if y != 0 => x % y,
         _ => return None,
     })
+}
+
+/// True when `code` contains an `s_barrier` that is not guaranteed to be reached uniformly by
+/// every wave of a multi-wave threadgroup (an early `s_endpgm`, a conditional bypass around
+/// `s_barrier`, a loop containing `s_barrier`, or an unresolved indirect jump).
+pub(super) fn has_non_uniform_barrier(code: &[u8]) -> bool {
+    let mut insts: Vec<Decoded> = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else {
+            return false;
+        };
+        off += d.len;
+        insts.push(d);
+    }
+    if !insts.iter().any(|d| d.inst.name == "S_BARRIER") {
+        return false;
+    }
+    rdna2::resolve_far_jumps(&mut insts);
+    let mut index: HashMap<u64, usize> = HashMap::with_capacity(insts.len());
+    for (i, d) in insts.iter().enumerate() {
+        index.insert(d.pc, i);
+    }
+    let is_end = |n: &str| matches!(n, "S_ENDPGM" | "S_ENDPGM_SAVED" | "S_ENDPGM_ORDERED_PS_DONE");
+    let mut leaders: BTreeSet<usize> = BTreeSet::from([0]);
+    for (i, d) in insts.iter().enumerate() {
+        if let Some(t) = rdna2::branch_target(d) {
+            let Some(&ti) = index.get(&t) else { return true };
+            leaders.insert(ti);
+            leaders.insert(i + 1);
+        } else if matches!(d.inst.name, "S_SETPC_B64" | "S_SWAPPC_B64") {
+            return true;
+        } else if d.inst.flags & rdna2::F_TERMINATOR != 0 || is_end(d.inst.name) {
+            leaders.insert(i + 1);
+        }
+    }
+    let starts: Vec<usize> = leaders.into_iter().filter(|&l| l < insts.len()).collect();
+    if starts.is_empty() {
+        return false;
+    }
+    let mut block_of: HashMap<usize, usize> = HashMap::with_capacity(starts.len());
+    for (b, &s) in starts.iter().enumerate() {
+        block_of.insert(s, b);
+    }
+    let nb = starts.len();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut is_exit = vec![false; nb];
+    let mut has_bar = vec![false; nb];
+    for (b, &s) in starts.iter().enumerate() {
+        let e = starts.get(b + 1).copied().unwrap_or(insts.len());
+        let mut terminated = false;
+        for d in &insts[s..e] {
+            if d.inst.name == "S_BARRIER" {
+                has_bar[b] = true;
+            }
+            if is_end(d.inst.name) {
+                is_exit[b] = true;
+                terminated = true;
+                break;
+            }
+            if let Some(t) = rdna2::branch_target(d) {
+                let tb = block_of[&index[&t]];
+                succs[b].push(tb);
+                if d.inst.name != "S_BRANCH" && e < insts.len() {
+                    succs[b].push(b + 1);
+                }
+                terminated = true;
+                break;
+            }
+        }
+        if !terminated {
+            if e < insts.len() {
+                succs[b].push(b + 1);
+            } else {
+                is_exit[b] = true;
+            }
+        }
+    }
+    // Reachable blocks from entry 0.
+    let mut reach = vec![false; nb];
+    let mut stack = vec![0usize];
+    reach[0] = true;
+    while let Some(u) = stack.pop() {
+        for &v in &succs[u] {
+            if !reach[v] {
+                reach[v] = true;
+                stack.push(v);
+            }
+        }
+    }
+    for b in 0..nb {
+        if !reach[b] || !has_bar[b] {
+            continue;
+        }
+        // 1) Can entry reach any exit block without executing `b`?
+        if b != 0 {
+            let mut vis = vec![false; nb];
+            vis[0] = true;
+            let mut st = vec![0usize];
+            while let Some(u) = st.pop() {
+                if is_exit[u] {
+                    return true;
+                }
+                for &v in &succs[u] {
+                    if v != b && !vis[v] {
+                        vis[v] = true;
+                        st.push(v);
+                    }
+                }
+            }
+        }
+        // 2) Is `b` reachable from itself (inside a loop)?
+        let mut vis = vec![false; nb];
+        let mut st = Vec::new();
+        for &v in &succs[b] {
+            if v == b {
+                return true;
+            }
+            if !vis[v] {
+                vis[v] = true;
+                st.push(v);
+            }
+        }
+        while let Some(u) = st.pop() {
+            for &v in &succs[u] {
+                if v == b {
+                    return true;
+                }
+                if !vis[v] {
+                    vis[v] = true;
+                    st.push(v);
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]

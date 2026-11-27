@@ -290,16 +290,16 @@ impl Lw {
         let src_code = Self::fv(d, "SRC0");
         let vdst = Self::fv(d, "VDST");
         let m0 = self.sreg(124);
+        let m0_lo = self.andc(m0, 0xFF);
         let top = self.top_vgpr().max(vdst).max(src_code.saturating_sub(256));
         let (rd_idx, wr_idx) = match name {
-            "v_movrels_b32" => (Some(m0), None),
-            "v_movreld_b32" => (None, Some(m0)),
-            "v_movrelsd_b32" => (Some(m0), Some(m0)),
+            "v_movrels_b32" => (Some(m0_lo), None),
+            "v_movreld_b32" => (None, Some(m0_lo)),
+            "v_movrelsd_b32" => (Some(m0_lo), Some(m0_lo)),
             "v_movrelsd_2_b32" => {
-                let r = self.andc(m0, 0x3FF);
                 let w = self.lshrc(m0, 16);
-                let w = self.andc(w, 0x3FF);
-                (Some(r), Some(w))
+                let w = self.andc(w, 0xFF);
+                (Some(m0_lo), Some(w))
             }
             _ => return err(d, "movrel"),
         };
@@ -309,25 +309,43 @@ impl Lw {
                     return err(d, "movrels: the source is not a VGPR");
                 }
                 let base = src_code - 256;
-                let mut v = self.c(0);
-                for k in 0..=top.saturating_sub(base) {
-                    let r = self.vreg(base + k);
-                    let is = self.cmpc(Pred::Eq, idx, k as u32);
-                    v = self.sel(is, r, v);
+                if let Some(k) = self.s.m.const_u64(idx) {
+                    if base + k <= top {
+                        self.vreg(base + k)
+                    } else {
+                        self.c(0)
+                    }
+                } else {
+                    let lim = top.saturating_sub(base).min(self.value_upper_bound(idx) as u64);
+                    let mut v = self.c(0);
+                    for k in 0..=lim {
+                        let r = self.vreg(base + k);
+                        let is = self.cmpc(Pred::Eq, idx, k as u32);
+                        v = self.sel(is, r, v);
+                    }
+                    v
                 }
-                v
             }
             None => self.code32(src_code, d.literal, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?,
         };
         let a = self.act();
         match wr_idx {
             Some(idx) => {
-                for k in 0..=top.saturating_sub(vdst) {
-                    let is = self.cmpc(Pred::Eq, idx, k as u32);
-                    let c = self.land(a, is);
-                    let old = self.vreg(vdst + k);
-                    let v = self.sel(c, value, old);
-                    self.wr(VAR_VGPR + (vdst + k) as u32, v);
+                if let Some(k) = self.s.m.const_u64(idx) {
+                    if vdst + k <= top {
+                        let old = self.vreg(vdst + k);
+                        let v = self.sel(a, value, old);
+                        self.wr(VAR_VGPR + (vdst + k) as u32, v);
+                    }
+                } else {
+                    let lim = top.saturating_sub(vdst).min(self.value_upper_bound(idx) as u64);
+                    for k in 0..=lim {
+                        let is = self.cmpc(Pred::Eq, idx, k as u32);
+                        let c = self.land(a, is);
+                        let old = self.vreg(vdst + k);
+                        let v = self.sel(c, value, old);
+                        self.wr(VAR_VGPR + (vdst + k) as u32, v);
+                    }
                 }
             }
             None => {
@@ -351,18 +369,31 @@ impl Lw {
         let base = src_code - 256;
         let top = self.top_vgpr().max(vdst).max(base);
         let m0 = self.sreg(124);
+        let m0_lo = self.andc(m0, 0xFF);
         let a = self.act();
         let td = self.vreg(vdst);
+        if let Some(k) = self.s.m.const_u64(m0_lo) {
+            let ts = if base + k <= top { self.vreg(base + k) } else { self.c(0) };
+            let nv = self.sel(a, ts, td);
+            self.wr(VAR_VGPR + vdst as u32, nv);
+            if base + k <= top {
+                let old = self.vreg(base + k);
+                let v = self.sel(a, td, old);
+                self.wr(VAR_VGPR + (base + k) as u32, v);
+            }
+            return Ok(());
+        }
+        let lim = top.saturating_sub(base).min(self.value_upper_bound(m0_lo) as u64);
         let mut ts = self.c(0);
-        for k in 0..=top.saturating_sub(base) {
+        for k in 0..=lim {
             let r = self.vreg(base + k);
-            let is = self.cmpc(Pred::Eq, m0, k as u32);
+            let is = self.cmpc(Pred::Eq, m0_lo, k as u32);
             ts = self.sel(is, r, ts);
         }
         let nv = self.sel(a, ts, td);
         self.wr(VAR_VGPR + vdst as u32, nv);
-        for k in 0..=top.saturating_sub(base) {
-            let is = self.cmpc(Pred::Eq, m0, k as u32);
+        for k in 0..=lim {
+            let is = self.cmpc(Pred::Eq, m0_lo, k as u32);
             let c = self.land(a, is);
             let old = self.vreg(base + k);
             let v = self.sel(c, td, old);

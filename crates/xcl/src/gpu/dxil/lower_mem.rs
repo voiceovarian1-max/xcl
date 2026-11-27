@@ -2549,13 +2549,47 @@ impl Lw {
             32..=63 => {
                 let k = (tgt - 32) as usize;
                 let outputs = self.mesh.as_ref().expect("mesh").outputs.clone();
-                let at = crate::gpu::recomp::param_registers(&outputs, true).get(k).map(|&r| crate::gpu::recomp::elements_at(&outputs, true, r)).unwrap_or_default();
-                for j in at {
-                    for c in 0..4 {
-                        if enabled(c) {
-                            let a = self.addc(vtx, (4 * (j + 1) + c) as u32);
-                            let v = comp(self, c);
-                            st.push((a, v));
+                let Some((lo_reg, hi_reg, packed16)) = crate::gpu::recomp::param_slot_regs(&outputs, None, k) else {
+                    return Ok(());
+                };
+                let unpack_half = |lw: &mut Lw, raw: Value, ct: u32| -> Value {
+                    if matches!(ct, 3 | 6) {
+                        let f = lw.s.f16_to_f32(raw);
+                        lw.bits(f)
+                    } else if matches!(ct, 2 | 5) {
+                        lw.sx16(raw)
+                    } else {
+                        raw
+                    }
+                };
+                let ranked_outs = crate::gpu::recomp::ranked(&outputs, true);
+                if packed16 && !compr {
+                    for (half_group, reg_opt) in [(0usize, Some(lo_reg)), (2usize, hi_reg)] {
+                        let Some(reg) = reg_opt else { continue };
+                        for j in crate::gpu::recomp::elements_at(&outputs, true, reg) {
+                            let ct = ranked_outs[j].component_type;
+                            for c in 0..4 {
+                                let ch = half_group + c / 2;
+                                if enabled(ch) {
+                                    let w = srcs[ch];
+                                    let raw = if c % 2 == 0 { self.andc(w, 0xFFFF) } else { self.lshrc(w, 16) };
+                                    let v = unpack_half(self, raw, ct);
+                                    let a = self.addc(vtx, (4 * (j + 1) + c) as u32);
+                                    st.push((a, v));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for j in crate::gpu::recomp::elements_at(&outputs, true, lo_reg) {
+                        let ct = ranked_outs[j].component_type;
+                        for c in 0..4 {
+                            if enabled(c) {
+                                let a = self.addc(vtx, (4 * (j + 1) + c) as u32);
+                                let raw = comp(self, c);
+                                let v = if compr { unpack_half(self, raw, ct) } else { raw };
+                                st.push((a, v));
+                            }
                         }
                     }
                 }

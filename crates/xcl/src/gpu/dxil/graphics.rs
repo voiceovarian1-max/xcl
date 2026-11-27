@@ -111,12 +111,15 @@ pub enum CompType {
 }
 
 impl CompType {
-    /// From a `D3D_REGISTER_COMPONENT_TYPE` (1 uint, 2 sint, 3 float).
+    /// From a `D3D_REGISTER_COMPONENT_TYPE` (1 uint32, 2 sint32, 3 float32, 4 uint16, 5 sint16, 6 float16).
     pub fn from_d3d(t: u32) -> Option<CompType> {
         match t {
             1 => Some(CompType::U32),
             2 => Some(CompType::I32),
             3 => Some(CompType::F32),
+            4 => Some(CompType::U16),
+            5 => Some(CompType::I16),
+            6 => Some(CompType::F16),
             _ => None,
         }
     }
@@ -508,11 +511,13 @@ impl GraphicsIo {
             Dir::Out => &self.outputs,
             Dir::Prim => &self.prims,
         };
-        // Per row: occupied columns, interpolation, and the first column after a system value.
+        // Per row: occupied columns, interpolation, precision class (16-bit vs 32-bit),
+        // and the first column after a system value.
         #[derive(Clone, Default)]
         struct Row {
             used: u8,
             interp: Option<Interp>,
+            bit16: Option<bool>,
             sv_end: bool,
             clip_cull: bool,
         }
@@ -521,7 +526,8 @@ impl GraphicsIo {
         let mut next_row = 0u32;
         let mut out = Vec::new();
         for (id, e) in list.iter().enumerate() {
-            let interp = e.interp.unwrap_or_else(|| self.default_interp(dir, e));
+            let mut interp = e.interp.unwrap_or_else(|| self.default_interp(dir, e));
+            let is16 = e.ty.is_16bit();
             let usage = self.usage.get(&(dir_code(dir), id as u32)).copied().unwrap_or(0);
             let ip = self.interpretation(dir, e.kind);
             let mask = ((1u16 << e.cols) - 1) as u8;
@@ -541,6 +547,7 @@ impl GraphicsIo {
                                 row.used & (mask << c) == 0
                                     && (row.used >> c) == 0
                                     && row.interp.is_none_or(|i| i == interp)
+                                    && row.bit16.is_none_or(|b| b == is16)
                                     && (row.used == 0 || row.clip_cull == (ip == Interpretation::ClipCull))
                                     && (!row.sv_end || ip == Interpretation::Sv)
                             }
@@ -559,13 +566,24 @@ impl GraphicsIo {
                 }
             };
             if let Some((r, c)) = at {
+                // Mixed-mode fixed-placement rows must share one interpolation mode in DXIL/PSV0.
+                if e.place.is_some() {
+                    if let Some(existing) = rows.get(r as usize).and_then(|row| row.interp) {
+                        interp = existing;
+                    }
+                }
                 for r in r..r + e.nrows() {
                     if rows.len() <= r as usize {
                         rows.resize(r as usize + 1, Row::default());
                     }
                     let row = &mut rows[r as usize];
                     row.used |= mask << c;
-                    row.interp = Some(interp);
+                    if row.interp.is_none() {
+                        row.interp = Some(interp);
+                    }
+                    if row.bit16.is_none() {
+                        row.bit16 = Some(is16);
+                    }
                     row.sv_end |= ip == Interpretation::Sv;
                     row.clip_cull |= ip == Interpretation::ClipCull;
                 }
@@ -1183,6 +1201,117 @@ impl Shader {
         let psg = if stage == Stage::Mesh { Some(sig_part(&prims, true, native16)) } else { None };
         let (isg, osg) = (sig_part(&ins, false, native16), sig_part(&outs, true, native16));
         Ok(container::container_with_signatures(stage, sm, &bitcode, sfi0, isg, osg, psg, container::psv_part_full(&psv)))
+    }
+}
+
+#[cfg(test)]
+mod fidelity_tests {
+    use super::*;
+    use crate::gpu::dxil::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    use crate::gpu::dxil::validate;
+    use crate::gpu::dxbc::SigElement as DxbcSig;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::{PsInterface, VsInterface};
+
+    #[test]
+    fn from_d3d_supports_16bit_component_types() {
+        assert_eq!(CompType::from_d3d(4), Some(CompType::U16));
+        assert_eq!(CompType::from_d3d(5), Some(CompType::I16));
+        assert_eq!(CompType::from_d3d(6), Some(CompType::F16));
+    }
+
+    #[test]
+    fn place_separates_16bit_and_32bit_rows_and_packs_16bit_together() {
+        let mut s = Shader::new(Stage::Pixel, (6, 6));
+        s.require(Feature::NativeLowPrecision);
+        let mut io = GraphicsIo::new(Stage::Pixel);
+        let a = io.input(SigElement::user("A", 0, CompType::F16, 2));
+        let b = io.input(SigElement::user("B", 0, CompType::F16, 2));
+        let c = io.input(SigElement::user("C", 0, CompType::F32, 2));
+        let d = io.input(SigElement::user("D", 0, CompType::F16, 1));
+        let t = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::F32, 4));
+        let av = io.load_input(&mut s, a, 0, 0);
+        let bv = io.load_input(&mut s, b, 0, 0);
+        let cv = io.load_input(&mut s, c, 0, 0);
+        let dv = io.load_input(&mut s, d, 0, 0);
+        let f32 = s.m.f32();
+        let a32 = s.m.cast(crate::gpu::dxil::module::CastOp::FPExt, av, f32);
+        let b32 = s.m.cast(crate::gpu::dxil::module::CastOp::FPExt, bv, f32);
+        let d32 = s.m.cast(crate::gpu::dxil::module::CastOp::FPExt, dv, f32);
+        for (col, v) in [a32, b32, cv, d32].into_iter().enumerate() {
+            io.store_output(&mut s, t, 0, col as u8, v);
+        }
+        let placed = io.place(Dir::In);
+        // A (F16x2) at (0,0), B (F16x2) packs into (0,2), C (F32x2) moves to (1,0),
+        // D (F16x1) cannot share row 1 with F32 so moves to (2,0).
+        assert_eq!(placed[0].at, Some((0, 0)));
+        assert_eq!(placed[1].at, Some((0, 2)));
+        assert_eq!(placed[2].at, Some((1, 0)));
+        assert_eq!(placed[3].at, Some((2, 0)));
+        let dxil = s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false });
+        if let Err(e) = validate::validate(&dxil) {
+            panic!("16-bit/32-bit separated signature failed validation: {e}");
+        }
+    }
+
+    #[test]
+    fn mixed_mode_fixed_row_adopts_row_interp_mode() {
+        let mut io = GraphicsIo::new(Stage::Pixel);
+        io.input(SigElement::user("A", 0, CompType::F32, 2).interp(Interp::LinearCentroid).at(0, 0));
+        io.input(SigElement::user("B", 0, CompType::F32, 2).interp(Interp::Linear).at(0, 2));
+        let placed = io.place(Dir::In);
+        assert_eq!(placed[0].interp, Interp::LinearCentroid);
+        assert_eq!(placed[1].interp, Interp::LinearCentroid);
+    }
+
+    #[test]
+    fn direct_dxil_vs_compr_and_ps_16bit_inputs_validate() {
+        let vs_code: Vec<u8> = [
+            ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 0), ("VSRC2", 0), ("VSRC3", 0)][..], None),
+            ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("COMPR", 1), ("VSRC0", 4), ("VSRC1", 5)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let vsi = VsInterface {
+            inputs: vec![],
+            outputs: vec![
+                DxbcSig { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 },
+                DxbcSig { name: "TEXCOORD".into(), index: 0, system_value: 0, component_type: 6, register: 1, mask: 0xF, rw_mask: 0xF, stream: 0 },
+            ],
+            attr_base: 4,
+            params: None,
+        };
+        let vk = translate_vertex(&vs_code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &vsi).unwrap();
+        if let Err(e) = validate::validate(&vk.dxil) {
+            panic!("direct DXIL VS compr f16 failed validation: {e}");
+        }
+
+        let ps_code: Vec<u8> = [
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 256 + 2)][..], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 256 + 3)], None),
+            ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 10), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 11), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("COMPR", 1), ("VSRC0", 4), ("VSRC1", 4), ("DONE", 1), ("VM", 1)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let psi = PsInterface {
+            inputs: vec![
+                DxbcSig { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 },
+                DxbcSig { name: "TEXCOORD".into(), index: 0, system_value: 0, component_type: 6, register: 1, mask: 0xF, rw_mask: 0xF, stream: 0 },
+            ],
+            outputs: vec![DxbcSig { name: "SV_Target".into(), index: 0, system_value: 64, component_type: 6, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
+            input_ena: (1 << 1) | (1 << 2),
+            attrs: None,
+        };
+        let pk = translate_pixel(&ps_code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &psi).unwrap();
+        if let Err(e) = validate::validate(&pk.dxil) {
+            panic!("direct DXIL PS 16-bit failed validation: {e}");
+        }
     }
 }
 
