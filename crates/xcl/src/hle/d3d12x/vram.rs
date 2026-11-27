@@ -180,6 +180,79 @@ const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// a pool tile given back is not reused before this (the GPU may still be at work on what the
 /// title released)
 const COOL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Page budget (`XCL_PAGE_BUDGET_MB`): a texture the CPU fills is not evicted before this
+/// long after it was placed, remapped or used in a transition.
+const EVICT_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Page budget: textures smaller than this are never evicted (UI, fonts, small lookups).
+const EVICT_MIN_TILES: u32 = 4;
+/// Page budget: tiles freed per eviction round once the pools are at the budget.
+const EVICT_BATCH: usize = 512;
+/// Page budget: after a round that found nothing to evict, pools grow past the budget for this
+/// long instead of trying again for every placement.
+const EVICT_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Page budget: pool heaps the pages may take, from `XCL_PAGE_BUDGET_MB` (0: no limit).
+fn pool_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let mb: usize = std::env::var("XCL_PAGE_BUDGET_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        if mb == 0 {
+            return 0;
+        }
+        // evicting unmaps a texture from another thread: only safe while a texture's last
+        // Release reaches `forget` before the object goes (`late_release` holds it until then)
+        if !super::late_release::enabled() {
+            crate::xlog_warn!("D3D12.X: XCL_PAGE_BUDGET_MB needs late release (XCL_LATE_RELEASE=0 is set): no page budget");
+            return 0;
+        }
+        let pools = (mb << 20).div_ceil(POOL_PAGES as usize * PAGE).max(1);
+        crate::xlog_info!("D3D12.X: page budget {mb} MB ({pools} pools of 64 MB): CPU-filled textures are evicted least recently used first beyond it");
+        pools
+    })
+}
+
+/// Page budget: the textures a view in a console descriptor slot names, with how many slots name
+/// each. Art a title only samples is never transitioned nor written (`touch` never sees it) and is
+/// still shown: a texture named by a view is not evicted.
+/// shortcut: keyed by the resource pointer; a released texture's count goes to whatever object
+/// reuses its address until its slots are written again (keeps that one, never evicts a named one
+/// unless its slots were rewritten in between).
+static VIEWS: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
+
+/// Page budget: whether there is one (`XCL_PAGE_BUDGET_MB`).
+pub(super) fn budget_on() -> bool {
+    pool_cap() != 0
+}
+
+/// Page budget: a view slot named `old` (None: nothing) and names `new` now (0: nothing).
+pub(super) fn viewed(old: Option<usize>, new: usize) {
+    let mut g = VIEWS.lock().unwrap();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(o) = old.filter(|&o| o != 0) {
+        if let Some(n) = m.get_mut(&o) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&o);
+            }
+        }
+    }
+    if new != 0 {
+        *m.entry(new).or_insert(0) += 1;
+    }
+}
+
+/// Page budget: whether a view slot names `res`.
+fn has_view(views: &Option<std::collections::HashMap<usize, u32>>, res: usize) -> bool {
+    views.as_ref().is_some_and(|m| m.contains_key(&res))
+}
+
+/// Page budget: textures whose tiles were evicted; the next upload or transition maps
+/// them again and uploads them whole.
+static EVICTED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// the number of textures in `EVICTED` (callers skip the lookup while it is 0)
+static EVICTED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REMAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A pool tile: (pool heap, tile in it).
 type Tile = (u32, u32);
@@ -232,6 +305,10 @@ struct Target {
     mapped: bool,
     used: Vec<usize>,
     used_extra: Vec<(usize, usize)>,
+    /// a texture the CPU fills (its texels can be uploaded again from the title's memory)
+    evictable: bool,
+    /// placed, remapped or transitioned last
+    touched: std::time::Instant,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
 }
@@ -429,6 +506,14 @@ impl TilePool {
         }
     }
 
+    /// Page budget: up to `n` tiles still cooling are free now, the oldest first.
+    fn take_cooling(&mut self, n: usize) {
+        for _ in 0..n {
+            let Some((tile, _)) = self.cooling.pop_front() else { break };
+            self.return_tiles(&[tile]);
+        }
+    }
+
     fn return_tiles(&mut self, tiles: &[Tile]) {
         for &(h, t) in tiles {
             let idx = h as usize;
@@ -623,6 +708,10 @@ struct Pages {
     scratch_flags: Vec<D3D12_TILE_RANGE_FLAGS>,
     scratch_offsets: Vec<u32>,
     scratch_counts: Vec<u32>,
+    /// page budget: no eviction round before this (the last one found nothing to evict)
+    evict_idle_until: Option<std::time::Instant>,
+    /// page budget: pool heaps the pages may take (`pool_cap`; 0: no limit)
+    cap: usize,
 }
 
 // D3D12 objects are free-threaded
@@ -661,6 +750,8 @@ impl Pages {
             scratch_flags: Vec::new(),
             scratch_offsets: Vec::new(),
             scratch_counts: Vec::new(),
+            evict_idle_until: None,
+            cap: pool_cap(),
         })
     }
 
@@ -804,6 +895,80 @@ impl Pages {
         }
     }
 
+    /// Page budget: unmap CPU-filled textures, least recently touched first, until `want`
+    /// tiles came back (pages other mapped textures still share stay). Each goes to `EVICTED`.
+    /// The tiles that came back (they are cooling).
+    unsafe fn evict_lru(&mut self, want: usize) -> usize {
+        let now = std::time::Instant::now();
+        let before = self.pool.free_total + self.pool.cooling.len();
+        let views = VIEWS.lock().unwrap();
+        let mut order: Vec<(std::time::Instant, usize)> = self
+            .targets
+            .iter()
+            .filter(|(&k, t)| t.evictable && t.mapped && t.total >= EVICT_MIN_TILES && now.duration_since(t.touched) >= EVICT_MIN_AGE && !has_view(&views, k))
+            .map(|(&k, t)| (t.touched, k))
+            .collect();
+        drop(views);
+        order.sort_unstable();
+        let mut evicted = Vec::new();
+        for (_, key) in order {
+            if self.pool.free_total + self.pool.cooling.len() - before >= want {
+                break;
+            }
+            let Some(t) = self.targets.get_mut(&key) else { continue };
+            let total = t.total;
+            let used = std::mem::take(&mut t.used);
+            let used_extra = std::mem::take(&mut t.used_extra);
+            t.mapped = false;
+            // MERGE-CHECK: main's lazy levels (`XCL_TEXTURE_LEVEL_PAGES`) reset here as in `unmap_superseded`, so an evicted texture's levels get pages again
+            if let Some(l) = t.levels.as_mut() {
+                LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+                l.groups.iter_mut().for_each(|g| g.3 = false);
+            }
+            let raw = key as *mut c_void;
+            if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
+                self.unmap(res, total);
+            }
+            self.release_tiles(used, used_extra, now, true);
+            evicted.push(key);
+        }
+        let freed = self.pool.free_total + self.pool.cooling.len() - before;
+        if !evicted.is_empty() {
+            let n = EVICTIONS.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed) + evicted.len() as u64;
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let step = LOGGED.load(std::sync::atomic::Ordering::Relaxed);
+            if n >= step {
+                LOGGED.store(n.max(1) * 2, std::sync::atomic::Ordering::Relaxed);
+                crate::xlog_info!("D3D12.X: page budget: {} textures evicted ({} MB back) this round, {n} so far", evicted.len(), (freed * PAGE) >> 20);
+            }
+            let mut g = EVICTED.lock().unwrap();
+            let s = g.get_or_insert_with(HashSet::new);
+            s.extend(evicted);
+            EVICTED_LEN.store(s.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        freed
+    }
+
+    /// The tiles of `range` a placement at `va` has no page for yet, and the pool heap of the
+    /// first page it shares.
+    fn missing_tiles(&self, va: usize, first: usize, own: usize, range: std::ops::Range<usize>) -> (usize, Option<u32>) {
+        let mut missing = 0usize;
+        let mut preferred: Option<u32> = None;
+        for i in range {
+            let existing = if i < own {
+                self.pages.get(&(first + i * PAGE)).map(|p| p.tile.0)
+            } else {
+                self.extra_pages.get(&(va, i)).map(|p| p.tile.0)
+            };
+            match existing {
+                Some(h) if preferred.is_none() => preferred = Some(h),
+                Some(_) => {}
+                None => missing += 1,
+            }
+        }
+        (missing, preferred)
+    }
+
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize)
@@ -816,19 +981,24 @@ impl Pages {
         let now = std::time::Instant::now();
         self.sweep(now);
 
-        let mut missing = 0usize;
-        let mut preferred: Option<u32> = None;
-        for i in range.clone() {
-            let existing = if i < own {
-                self.pages.get(&(first + i * PAGE)).map(|p| p.tile.0)
-            } else {
-                self.extra_pages.get(&(va, i)).map(|p| p.tile.0)
-            };
-            match existing {
-                Some(h) if preferred.is_none() => preferred = Some(h),
-                Some(_) => {}
-                None => missing += 1,
+        let (mut missing, mut preferred) = self.missing_tiles(va, first, own, range.clone());
+        // page budget: at the budget the tiles come from textures evicted now and from tiles
+        // still cooling, before another pool heap is made. A round that found nothing to evict
+        // is not repeated for a second (each one walks every target): the pools grow meanwhile.
+        if self.cap > 0 && self.pools.len() >= self.cap {
+            self.pool.drain_cooling(now);
+            let have = self.pool.free_total + self.pool.cooling.len();
+            if have < missing && self.evict_idle_until.is_none_or(|t| now >= t) {
+                if self.evict_lru((missing - have).max(EVICT_BATCH)) == 0 {
+                    self.evict_idle_until = Some(now + EVICT_IDLE);
+                } else {
+                    // (an evicted texture may have shared a page with this placement)
+                    (missing, preferred) = self.missing_tiles(va, first, own, range.clone());
+                }
             }
+            // at the budget a tile is reused before it cooled: a draw still in flight may read
+            // the newer texels there for a frame
+            self.pool.take_cooling(missing.saturating_sub(self.pool.free_total));
         }
 
         let pools = &mut self.pools;
@@ -1034,10 +1204,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), evictable: false, touched: std::time::Instant::now(), levels });
                 true
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, touched: std::time::Instant::now(), levels: None });
                 true
             } else {
                 false
@@ -1116,6 +1286,8 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     // (lazy levels: they get their pages again with their next texels)
     if let Some(t) = pages.targets.get_mut(&key).filter(|t| t.levels.is_some()) {
         t.mapped = true;
+        // MERGE-CHECK: page budget's `touched` set on main's lazy-levels remap too, as on the remap below
+        t.touched = std::time::Instant::now();
         return true;
     }
     let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
@@ -1125,8 +1297,85 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.used = used;
         t.used_extra = used_extra;
         t.mapped = true;
+        t.touched = std::time::Instant::now();
     }
     true
+}
+
+/// Page budget: `res` was evicted by the page budget.
+pub(super) fn is_evicted(res: usize) -> bool {
+    any_evicted() && EVICTED.lock().unwrap().as_ref().is_some_and(|s| s.contains(&res))
+}
+
+/// Page budget: map `res` again if the page budget evicted it. True when it was evicted and is
+/// mapped again (the caller uploads it whole); a failed remap leaves it evicted, to be tried
+/// again at its next write, transition or copy.
+pub(super) unsafe fn revive(res: &ID3D12Resource) -> bool {
+    let key = res.as_raw() as usize;
+    if !is_evicted(key) || !remap_if_unmapped(res) {
+        return false;
+    }
+    let mut g = EVICTED.lock().unwrap();
+    let Some(s) = g.as_mut() else { return false };
+    if !s.remove(&key) {
+        return false;
+    }
+    EVICTED_LEN.store(s.len(), std::sync::atomic::Ordering::Relaxed);
+    REMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Page budget: whether any texture is evicted (callers skip the lookup otherwise).
+pub(super) fn any_evicted() -> bool {
+    EVICTED_LEN.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Page budget: the textures `res` were used (a transition the title submitted, a CPU write
+/// uploaded): later to be evicted.
+pub(super) fn touch(res: impl IntoIterator<Item = usize>) {
+    if pool_cap() == 0 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut g = PAGES.lock().unwrap();
+    for r in res {
+        for pages in g.values_mut().flatten() {
+            if let Some(t) = pages.targets.get_mut(&r) {
+                t.touched = now;
+                break;
+            }
+        }
+    }
+}
+
+/// Page budget: `res` is a texture `title_textures` keeps in step with the title's memory, so
+/// its texels can be uploaded again after an eviction.
+pub(super) fn set_evictable(res: usize) {
+    set_evictable_to(res, true);
+}
+
+/// Page budget: the GPU wrote `res`; its texels are not in the title's memory, so it is
+/// never evicted.
+pub(super) fn pin(res: usize) {
+    set_evictable_to(res, false);
+}
+
+fn set_evictable_to(res: usize, on: bool) {
+    if pool_cap() == 0 {
+        return;
+    }
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        if let Some(t) = pages.targets.get_mut(&res) {
+            t.evictable = on;
+            return;
+        }
+    }
+}
+
+/// Page budget: (textures evicted, textures mapped again) so far.
+pub fn eviction_counts() -> (u64, u64) {
+    (EVICTIONS.load(std::sync::atomic::Ordering::Relaxed), REMAPS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// A resource released: its pages are no longer its.
@@ -1142,6 +1391,11 @@ fn forget_pages(resource: usize) {
         }
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
+        }
+        drop(g);
+        if let Some(s) = EVICTED.lock().unwrap().as_mut() {
+            s.remove(&resource);
+            EVICTED_LEN.store(s.len(), std::sync::atomic::Ordering::Relaxed);
         }
         return;
     }
@@ -1280,6 +1534,22 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
 
 #[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Page budget, for tests: evict `res` now (as the least recently touched texture the CPU
+/// fills); whether it was.
+#[cfg(test)]
+pub(super) unsafe fn evict_for_test(res: usize) -> bool {
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        if let Some(t) = pages.targets.get_mut(&res) {
+            t.evictable = true;
+            t.touched = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(600)).unwrap();
+            pages.evict_lru(1);
+            return pages.targets.get(&res).is_some_and(|t| !t.mapped);
+        }
+    }
+    false
+}
 
 /// Tile identities of one mapped resource: title pages, then extra pages.
 /// A device-wide byte count also falls when unrelated idle pages are swept.
@@ -2489,6 +2759,173 @@ mod tests {
                 "AFTER  ({TEX_COUNT} x 2MiB textures, {new_calls} UpdateTileMappings + {TEX_COUNT} Signals): submit={new_submit:?} gpu_done={new_total:?}"
             );
             assert!(new_calls < old_calls);
+        }
+    }
+
+    /// Page budget: the least recently touched CPU-filled texture gives its
+    /// pages back first, a GPU-written one never does, and an evicted one maps again.
+    #[test]
+    fn page_budget_evicts_the_least_recently_touched_cpu_filled_texture() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            let (Some(old), Some(newer), Some(written)) = (place_at(0x60_0000_0000), place_at(0x60_1000_0000), place_at(0x60_2000_0000)) else {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            };
+            let key = |r: &ID3D12Resource| r.as_raw() as usize;
+            let dev_key = dev.as_raw() as usize;
+            let now = Instant::now();
+            {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                // (`set_evictable` / `pin` do nothing without XCL_PAGE_BUDGET_MB)
+                for (r, age, evictable) in [(&old, 30, true), (&newer, 20, true), (&written, 40, false)] {
+                    let t = pages.targets.get_mut(&key(r)).unwrap();
+                    t.touched = now - Duration::from_secs(age);
+                    t.evictable = evictable;
+                }
+                let used_before = pages.pages.len();
+                assert!(pages.evict_lru(1) > 0, "tiles came back");
+                assert!(!pages.targets[&key(&old)].mapped, "the oldest CPU-filled texture is evicted");
+                assert!(pages.targets[&key(&newer)].mapped, "one is enough for one tile");
+                assert!(pages.targets[&key(&written)].mapped, "a GPU-written texture is never evicted");
+                assert!(pages.pages.len() < used_before, "its pages went back");
+                // nothing left to evict: the round says so (`bind` then waits before the next)
+                pages.targets.get_mut(&key(&newer)).unwrap().evictable = false;
+                assert_eq!(pages.evict_lru(1), 0, "nothing evictable");
+            }
+            assert!(is_evicted(key(&old)) && !is_evicted(key(&newer)));
+            assert!(revive(&old), "mapped again");
+            assert!(!is_evicted(key(&old)) && !revive(&old), "once");
+            assert!(PAGES.lock().unwrap().get(&dev_key).unwrap().as_ref().unwrap().targets[&key(&old)].mapped, "mapped again");
+            {
+                // a texture a view names is kept (art only sampled); once no slot names it, it goes
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                pages.targets.get_mut(&key(&newer)).unwrap().evictable = true;
+                viewed(None, key(&newer));
+                assert_eq!(pages.evict_lru(1), 0, "named by a view: kept");
+                viewed(Some(key(&newer)), 0);
+                assert!(pages.evict_lru(1) > 0 && !pages.targets[&key(&newer)].mapped, "no view names it: evicted");
+            }
+            drop((old, newer, written));
+        }
+    }
+
+    /// Texture pool: slots in a row, searched round the heap from the cursor.
+    #[test]
+    fn page_budget_a_texture_stays_named_while_any_slot_names_it() {
+        let (a, b) = (0x7fff_0001_0000usize, 0x7fff_0002_0000usize);
+        let named = |r| has_view(&VIEWS.lock().unwrap(), r);
+        viewed(None, a);
+        viewed(None, a);
+        viewed(Some(a), b);
+        assert!(named(a) && named(b), "one slot still names a");
+        viewed(Some(a), 0);
+        assert!(!named(a) && named(b));
+        viewed(Some(b), 0);
+        assert!(!named(b));
+    }
+
+    /// Page budget: at the cap, one texture placed evicts one batch, and its other tiles come
+    /// from that batch – not one more round per tile (#640 review: one placement evicted every
+    /// eligible texture).
+    #[test]
+    fn page_budget_one_placement_at_the_cap_evicts_one_batch() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            // 512 x 512 RGBA8: 16 tiles each
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            // 40 x 16 = 640 tiles: more than one batch of 512
+            let old: Vec<ID3D12Resource> = (0..40).filter_map(|i| place_at(0x61_0000_0000 + i * 0x10_0000)).collect();
+            if old.len() != 40 {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            }
+            let key = |r: &ID3D12Resource| r.as_raw() as usize;
+            let dev_key = dev.as_raw() as usize;
+            let now = Instant::now();
+            let (saved_free, saved_total, saved_cooling) = {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                for (i, r) in old.iter().enumerate() {
+                    let t = pages.targets.get_mut(&key(r)).unwrap();
+                    t.touched = now - Duration::from_secs(100 - i as u64);
+                    t.evictable = true;
+                }
+                // at the cap with no spare tile: the next tile has to come from an eviction
+                pages.cap = pages.pools.len();
+                pages.evict_idle_until = None;
+                let free: Vec<Vec<u32>> = pages.pool.free_by_heap.iter_mut().map(std::mem::take).collect();
+                (free, std::mem::take(&mut pages.pool.free_total), std::mem::take(&mut pages.pool.cooling))
+            };
+            let new = place_at(0x61_8000_0000);
+            let mapped: Vec<bool> = {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                let mapped = old.iter().map(|r| pages.targets[&key(r)].mapped).collect();
+                pages.cap = 0;
+                for (h, mut free) in saved_free.into_iter().enumerate() {
+                    pages.pool.free_by_heap[h].append(&mut free);
+                    pages.pool.dirty_sort[h] = true;
+                }
+                pages.pool.free_total += saved_total;
+                pages.pool.cooling.extend(saved_cooling);
+                mapped
+            };
+            assert!(new.is_some(), "placed from the evicted tiles");
+            let evicted = mapped.iter().filter(|m| !**m).count();
+            assert_eq!(evicted, 32, "one batch of 512 tiles: the 32 least recently touched");
+            assert!(mapped[..32].iter().all(|m| !m) && mapped[32..].iter().all(|m| *m), "oldest first");
+            for r in &old {
+                let _ = revive(r);
+            }
+            drop((old, new));
         }
     }
 }

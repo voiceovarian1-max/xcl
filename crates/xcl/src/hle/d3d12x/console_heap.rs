@@ -812,20 +812,21 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
     }
 }
 
-/// view slot address → the resource its view names (`XCL_TRACE_FRAME`, `XCL_DUMP_TARGETS`)
+/// view slot address → the resource its view names (`XCL_TRACE_FRAME`, `XCL_DUMP_TARGETS`, the page budget)
 static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !(super::present::trace_frame() || super::targets::enabled() || super::capture::enabled()) {
+    // (the page budget keeps the textures views name: `vram::viewed`)
+    let budget = super::vram::budget_on();
+    if s.sampler || !(budget || super::present::trace_frame() || super::targets::enabled() || super::capture::enabled()) {
         return;
     }
     let mut g = RES.lock().unwrap();
     let m = g.get_or_insert_with(Default::default);
-    if res == 0 {
-        m.remove(&s.at);
-    } else {
-        m.insert(s.at, res);
+    let old = if res == 0 { m.remove(&s.at) } else { m.insert(s.at, res) };
+    if budget && old != Some(res) {
+        super::vram::viewed(old, res);
     }
 }
 

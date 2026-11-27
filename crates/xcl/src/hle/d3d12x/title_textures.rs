@@ -543,6 +543,8 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     // the data the title is about to write there is for the next submit
     mark_hot(hot_src, hot_bytes);
+    // page budget: its texels can be uploaded again from the title's memory
+    super::vram::set_evictable(res as usize);
     Ok(())
 }
 
@@ -797,6 +799,19 @@ pub fn note_gpu_write(list: usize, res: usize) {
             v.push(res);
         }
     }
+    // page budget: its texels are not in the title's memory, so the page budget keeps it; one
+    // already evicted is mapped again now, before the copy runs (the title's queue waits for
+    // the mapping), and is not uploaded (`gpu_written`). The title holds it while it records.
+    super::vram::pin(res);
+    if super::vram::any_evicted() {
+        let p = res as *mut c_void;
+        if let Some(r) = unsafe { ID3D12Resource::from_raw_borrowed(&p) } {
+            // MERGE-CHECK: with main's lazy levels an evicted texture comes back with no level mapped (`map_levels` above skipped it): all of them before the GPU's write
+            if unsafe { super::vram::revive(r) } && super::vram::level_pages() {
+                unsafe { super::vram::map_levels(r, None) };
+            }
+        }
+    }
 }
 
 /// PC command list → the textures kept in step its GPU work writes (`note_gpu_write`), since it
@@ -941,6 +956,8 @@ pub fn submitted(lists: &[*mut c_void]) {
     if notes.is_empty() && writes.is_empty() {
         return;
     }
+    // page budget: a texture the title uses is recent
+    super::vram::touch(notes.iter().map(|&(res, _, _)| res));
     let mut t = TEXTURES.lock().unwrap();
     for (res, sub, after) in notes {
         if let Some(e) = t.get_mut(res) {
@@ -954,6 +971,45 @@ pub fn submitted(lists: &[*mut c_void]) {
             if let Some(e) = t.get_mut(res) {
                 (e.gpu_written, e.written_call) = (true, call);
             }
+        }
+    }
+}
+
+/// Page budget: before the PC lists `lists` are submitted (and before `refresh`), the evicted
+/// textures their transitions name are mapped again and made pending, so this submit uploads
+/// them whole before the lists sample them.
+pub(super) fn revive_listed(lists: &[*mut c_void]) {
+    if !super::vram::any_evicted() {
+        return;
+    }
+    let mut named: Vec<usize> = {
+        let g = LIST_NOTES.lock().unwrap();
+        lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().map(|&(res, _, _)| res).filter(|&res| super::vram::is_evicted(res)).collect()
+    };
+    if named.is_empty() {
+        return;
+    }
+    named.sort_unstable();
+    named.dedup();
+    // a reference each while they are mapped (taken under the lock `forget` takes)
+    let live = {
+        let t = TEXTURES.lock().unwrap();
+        named.retain(|res| t.by_res.contains_key(res) || t.shadowed.contains_key(res));
+        unsafe { clone_resources(&named) }
+    };
+    let revived: Vec<usize> = live.iter().filter(|r| unsafe { super::vram::revive(r) }).map(|r| r.as_raw() as usize).collect();
+    if revived.is_empty() {
+        return;
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    for res in revived {
+        let Some(e) = t.get_mut(res) else { continue };
+        // (mapped again on fresh tiles: nothing of it is there)
+        texture_upload::forget(&e.known);
+        if !e.pending && !e.gpu_written {
+            e.pending = true;
+            PENDING.fetch_add(1, Ordering::Relaxed);
+            t.pending_res.insert(res);
         }
     }
 }
@@ -1799,6 +1855,24 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
         AGAIN.lock().unwrap().extend(later);
         todo
     });
+    // page budget: a texture the CPU wrote again is recent, and one evicted is mapped again
+    // before its whole upload (one that cannot be mapped now stays evicted and is not uploaded)
+    let mut todo = todo;
+    if super::vram::any_evicted() {
+        todo.retain_mut(|d| {
+            let key = d.res.as_raw() as usize;
+            if !super::vram::is_evicted(key) {
+                return true;
+            }
+            let back = super::vram::revive(&d.res);
+            if back {
+                texture_upload::forget(&d.known);
+                d.whole = true;
+            }
+            back
+        });
+    }
+    super::vram::touch(todo.iter().map(|d| d.res.as_raw() as usize));
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     let t_tex = std::time::Instant::now();
     DIRTY_BUF.with(|dcell| upload_all(todo, &dcell.borrow(), page as usize, ID3D12CommandQueue::from_raw_borrowed(&queue)));
@@ -3021,6 +3095,75 @@ pub(super) mod tests {
             }
             assert_eq!(read_r8(dev, &queue, &texture), vec![0x77; 64 * 64]);
             ON_QUEUE.lock().unwrap().remove(&key);
+        }
+    }
+
+    /// Page budget: before a submit, an evicted texture its lists transition is mapped again and
+    /// uploaded whole (pending, its content hash forgotten), and a copy into an evicted texture
+    /// maps it again when it is recorded, with no upload over what the GPU writes (#640 review).
+    #[test]
+    fn page_budget_an_evicted_texture_is_mapped_again_before_the_work_that_uses_it() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let dev = super::super::real::device_raw();
+            // 512 x 512 R8: 4 tiles, the smallest texture the budget evicts
+            let pc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let console = console_desc(3, 512, 512, 1, 1, DXGI_FORMAT_R8_UNORM.0 as u32, 1);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::vram::place_pages(dev, va, &pc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(512 * 512), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            let (Some(sampled), Some(copied)) = (place_at(0x63_0000_0000), place_at(0x63_1000_0000)) else {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            };
+            let (a, b) = (sampled.as_raw() as usize, copied.as_raw() as usize);
+            register(dev, sampled.as_raw(), 0x63_0000_0000, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            register(dev, copied.as_raw(), 0x63_1000_0000, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            {
+                // both uploaded once already
+                let mut t = TEXTURES.lock().unwrap();
+                for r in [a, b] {
+                    let e = t.get_mut(r).unwrap();
+                    if e.pending {
+                        e.pending = false;
+                        PENDING.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            let known = Arc::clone(&TEXTURES.lock().unwrap().get_mut(a).unwrap().known);
+            texture_upload::all_sent(&known, 0x63_0000_0000, 512 * 512);
+            assert!(super::super::vram::evict_for_test(a) && super::super::vram::evict_for_test(b));
+
+            // a list that samples `a` is submitted: `a` is mapped again first, and uploaded whole
+            let list = 0x7E57_0640usize;
+            LIST_NOTES.lock().unwrap().entry(list).or_default().push((a, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+            revive_listed(&[list as *mut c_void]);
+            assert!(!super::super::vram::is_evicted(a), "mapped again before the submit");
+            assert!(TEXTURES.lock().unwrap().get_mut(a).unwrap().pending, "its upload runs in this submit's refresh");
+            assert!(texture_upload::knows_nothing(&known), "not left out as unchanged");
+
+            // a copy into `b` is recorded: mapped again now, and not uploaded over
+            assert!(super::super::vram::is_evicted(b));
+            note_gpu_write(0, b);
+            assert!(!super::super::vram::is_evicted(b), "mapped again before the copy runs");
+            assert!(!TEXTURES.lock().unwrap().get_mut(b).unwrap().pending, "the GPU's texels are not uploaded over");
+
+            list_reset(list);
+            forget(a);
+            forget(b);
+            drop((sampled, copied));
         }
     }
 

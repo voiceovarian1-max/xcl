@@ -3854,7 +3854,6 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     super::capture::kickoff(this, queue);
 
     let q_raw = queue as *mut c_void;
-    super::title_textures::refresh(q_raw);
     super::gpu_profile::note_queue(q_raw);
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
@@ -3862,6 +3861,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     // If this list was previously split mid-recording around a `Wait64`, flush all earlier closed
     // segments in exact order before submitting `this`, then resume recording on `primary`.
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
+    // page budget: evicted textures this list and the segments before it transition are mapped
+    // again, uploaded by the refresh
+    let mut lists = kickoff_split.as_ref().map_or_else(Vec::new, |(_, prior, _)| prior.clone());
+    lists.push(this);
+    super::title_textures::revive_listed(&lists);
+    super::title_textures::refresh(q_raw);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {

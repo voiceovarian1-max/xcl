@@ -190,6 +190,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if let Some(over) = crate::hle::d3d12x::real::over_video_budget(local, budget) {
                     crate::xlog_warn!("video memory: {} MB in use, {} MB over the budget of {} MB Windows gives this process", mb(local), mb(over), mb(budget));
                 }
+                let (evicted, mapped_again) = crate::hle::d3d12x::vram::eviction_counts();
+                if evicted > 0 {
+                    crate::xlog_info!("page budget: {evicted} textures evicted, {mapped_again} mapped again");
+                }
                 last = now;
             }
         });

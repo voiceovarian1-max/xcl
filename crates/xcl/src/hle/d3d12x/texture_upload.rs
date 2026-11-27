@@ -139,6 +139,12 @@ pub(super) fn stale(known: &Known, parts: Vec<(usize, usize)>) {
     });
 }
 
+/// Whether nothing is known about what the PC texture holds (`forget`).
+#[cfg(test)]
+pub(super) fn knows_nothing(known: &Known) -> bool {
+    known.lock().unwrap().hashes.is_empty()
+}
+
 /// `changed` of a texture (None: all of it) went up on `to`. An older upload of the texture on
 /// another queue that has not run yet (and that `to`'s queue has not waited for: `waited`) can land
 /// over it: it goes up again, behind that one (`take_again`). True when there is such a thing.

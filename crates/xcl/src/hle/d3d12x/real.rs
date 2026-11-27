@@ -9344,11 +9344,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             super::list_x::record_deferred(l);
         }
     }
-    // textures in title memory the CPU wrote since: uploaded again first
+    // (local) the lists are mapped to the PC ones before the refresh: the page budget's evicted
+    // textures they transition are mapped again first, and the refresh uploads them
     let submit_t0 = std::time::Instant::now();
-    super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
-    let t_lists = std::time::Instant::now();
-    super::submit_cost::call(t_lists - submit_t0);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
@@ -9359,6 +9357,12 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             mapped.push(l);
         }
     }
+    // page budget: evicted textures these lists transition are mapped again, uploaded below
+    super::title_textures::revive_listed(&mapped);
+    // textures in title memory the CPU wrote since: uploaded again first
+    super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
+    let t_lists = std::time::Instant::now();
+    super::submit_cost::call(t_lists - submit_t0);
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::gpu_profile::note_queue(this);
     let t_exec = std::time::Instant::now();
