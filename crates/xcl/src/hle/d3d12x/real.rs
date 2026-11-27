@@ -2898,6 +2898,9 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
     // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
     let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     x[0x34..].fill(0);
+    // (the padding after the dimension too: a title leaves what its stack held there, and the same
+    // texture at the same address was made again for each – 19,780 of 65,536 in a retail game's world)
+    x[4..8].fill(0);
     if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
         return r as *mut c_void;
     }
