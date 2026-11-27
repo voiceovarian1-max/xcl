@@ -1027,11 +1027,44 @@ fn stored_need(text: &str) -> usize {
     text.trim().parse::<usize>().unwrap_or(0)
 }
 
+/// Whether this process is running under Wine on an AMD GPU (`amdgpu`, PCI vendor `0x1002`).
+/// On `amdgpu`, a multi-GiB `userptr` BO imported via `OpenExistingHeapFromAddress` stalls
+/// every Vulkan submission (~150 ms/frame), whereas NVIDIA Linux does not hit that stall and
+/// benefits from a larger coherent window.
+fn wine_amd_gpu() -> bool {
+    static AMD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AMD.get_or_init(|| {
+        if !crate::util::under_wine() {
+            return false;
+        }
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE};
+        let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+            return false;
+        };
+        let mut i = 0u32;
+        while let Ok(adapter) = unsafe { factory.EnumAdapters1(i) } {
+            i += 1;
+            if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
+                    return desc.VendorId == 0x1002;
+                }
+            }
+        }
+        false
+    })
+}
+
 /// Bytes the coherent window(s) are made with for a runtime layout of `windows` windows.
 pub fn coherent_hint_for(windows: usize) -> usize {
     let cap = max_coherent_bytes(windows);
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return (mb << 20).clamp(GRAIN, cap);
+    }
+    // Under Wine/vkd3d-proton on Linux (amdgpu), a multi-GiB userptr BO imported via
+    // OpenExistingHeapFromAddress stalls every GPU submission (~150 ms/frame); keep the
+    // coherent window at 512 MiB and place overflow title GPU heaps in the sparse VRAM windows.
+    if wine_amd_gpu() {
+        return RUNTIME_COMMITTED_CAP;
     }
     let route = crate::hle::kernelx::coherent_heaps_route();
     let title = std::fs::read_to_string(coherent_file(&route)).map_or(0, |s| stored_need(&s));
