@@ -1159,6 +1159,12 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 }
 
 fn note_write(list: usize, va: u64, size: u64) {
+    // lazily allocated sparse tiles the GPU is about to write get video memory. Before the list's
+    // lock is taken: the sparse state's lock is held around list calls that take it (a copy
+    // back resets its list), so the other order stood still (a retail title, 6 s into a run).
+    if size != 0 && crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize)) {
+        unsafe { super::sparse::ensure_lazy_mapped(va as usize, size as usize) };
+    }
     recording(list).lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 

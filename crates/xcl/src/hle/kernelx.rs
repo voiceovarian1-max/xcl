@@ -1014,6 +1014,13 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
             }
+            if crate::util::under_wine() {
+                let rounded = size.max(1).div_ceil(align) * align;
+                if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc_lazy(rounded, align) {
+                    trace_mem("VirtualAlloc (graphics, sparse VRAM lazy fallback)", 0, rounded, t as u64, p, q);
+                    return q as *mut c_void;
+                }
+            }
             // diagnostic: a GPU heap the coherent window has no room for (plain memory from here)
             static UNFIT: AtomicUsize = AtomicUsize::new(0);
             static UNFIT_BYTES: AtomicUsize = AtomicUsize::new(0);

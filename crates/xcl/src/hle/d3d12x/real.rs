@@ -2894,6 +2894,20 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let (words, at, len) = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         super::view_want::want(super::view_want::Path::ViewAt, at, len);
+        let elem = if raw {
+            4
+        } else if b.StructureByteStride != 0 {
+            b.StructureByteStride
+        } else {
+            crate::gpu::desc::format_bytes(crate::gpu::desc::gfx10_format(v.Format).unwrap_or(22))
+        };
+        let uav_start = va.saturating_add(b.FirstElement.saturating_mul(elem as u64)) as usize;
+        let uav_bytes = (b.NumElements as u64).saturating_mul(elem as u64) as usize;
+        super::sparse::ensure_lazy_mapped(uav_start, uav_bytes);
+        let counter = (view.add(0x30) as *const u64).read_unaligned();
+        if counter != 0 {
+            super::sparse::ensure_lazy_mapped(counter as usize, 4);
+        }
         return super::console_heap::write(&slot, &words);
     }
     dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);

@@ -947,6 +947,37 @@ pub fn pool_bytes() -> (usize, usize) {
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
 /// every page it touches; `init` commits them once the windows exist.
 static EARLY: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+/// Ranges committed on the CPU in sparse windows whose VRAM tiles are mapped lazily on first
+/// non-zero CPU write (`alloc_lazy`) or GPU write target registration, avoiding eager VRAM
+/// allocation for untouched pages or GPU-owned render targets placed inside large title heaps.
+static LAZY_RANGES: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+static LAZY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn in_lazy_range(lazy: &BTreeMap<usize, usize>, a: usize) -> bool {
+    lazy.range(..=a).next_back().is_some_and(|(_, &e)| a < e)
+}
+
+fn lazy_overlaps_tile(lazy: &BTreeMap<usize, usize>, t: usize) -> bool {
+    lazy.range(..t.saturating_add(TILE)).next_back().is_some_and(|(_, &e)| e > t)
+}
+
+fn lazy_tile_holes(lazy: &BTreeMap<usize, usize>, t: usize) -> u16 {
+    let mut holes = 0u16;
+    for k in 0..PAGES_PER_TILE {
+        if !in_lazy_range(lazy, t + k * PAGE) {
+            holes |= 1u16 << k;
+        }
+    }
+    holes
+}
+
+fn page_has_nonzero(bytes: &[u8]) -> bool {
+    let mut chunks = bytes.chunks_exact(8);
+    if chunks.any(|c| u64::from_ne_bytes(c.try_into().unwrap()) != 0) {
+        return true;
+    }
+    chunks.remainder().iter().any(|&b| b != 0)
+}
 
 /// The pages `[a, a + n)` touches, as `[start, end)`.
 fn page_span(a: usize, n: usize) -> (usize, usize) {
@@ -1200,6 +1231,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             let old = STATE.lock().unwrap().replace(s);
             drop(old);
             drop(old_queue);
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
                 committed(a, b - a);
             }
@@ -2410,6 +2442,54 @@ fn uav_to_copy(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
 }
 
 /// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
+/// 4 GiB window boundary when `size <= 4 GiB`). Commits CPU pages immediately but defers
+/// mapping 64 KiB VRAM tiles until the CPU writes non-zero data (or `place_buffer` pins them).
+// PORT-CHECK: #877's lazy ranges kept beside HEAD's own lazy tiles (`XCL_SPARSE_LAZY`, `LAZY` entries); kernelx / real.rs / list_x still call alloc_lazy / ensure_lazy_mapped
+pub unsafe fn alloc_lazy(size: usize, align: usize) -> Option<(usize, usize)> {
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = u.sparse_alloc(size, align)?;
+    if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        u.sparse_release(addr);
+        return None;
+    }
+    let (start, end) = page_span(addr, rounded);
+    early_add(&mut LAZY_RANGES.lock().unwrap(), start, end);
+    LAZY_ACTIVE.store(true, Ordering::Release);
+    MAPPED_GEN.fetch_add(1, Ordering::Release);
+    Some((addr, rounded))
+}
+
+/// Ensure any lazily-allocated sparse tiles overlapping `[a, a + n)` are backed by VRAM
+/// (called when the GPU is about to write directly to a buffer UAV or memory-op target).
+pub unsafe fn ensure_lazy_mapped(a: usize, n: usize) {
+    if n == 0 || !LAZY_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let mut g = lock_state();
+    let Some(s) = g.as_mut() else { return };
+    if s.window_index(a).is_none() {
+        return;
+    }
+    let lazy = LAZY_RANGES.lock().unwrap();
+    if lazy.is_empty() {
+        return;
+    }
+    let first = a & !(TILE - 1);
+    let end = a.saturating_add(n);
+    let mut t = first;
+    while t < end {
+        if !s.mapped.contains_key(&t) && lazy_overlaps_tile(&lazy, t) {
+            let holes = lazy_tile_holes(&lazy, t);
+            s.ensure_mapped(t, TILE, |_| holes);
+        }
+        match t.checked_add(TILE) {
+            Some(next) => t = next,
+            None => break,
+        }
+    }
+}
+
+/// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
 /// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
 /// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
@@ -2770,15 +2850,30 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
+    let (start, end) = page_span(a, n);
+    let lazy_changed = {
+        let mut lazy = LAZY_RANGES.lock().unwrap();
+        let before = lazy.len();
+        let had = lazy.range(..end).next_back().is_some_and(|(_, &e)| e > start);
+        if had {
+            early_remove(&mut lazy, start, end);
+        }
+        had || lazy.len() != before
+    };
     let mut g = lock_in_turn(&STATE, &SUBMITS_WAITING);
     let _held = holding(Holder::Commits);
     forget_released(&mut g);
     let Some(s) = g.as_mut() else {
-        let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
+        if lazy_changed {
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
+        }
         return;
     };
     s.decommit_range(a, n);
+    if lazy_changed {
+        MAPPED_GEN.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// `decommitted` around the caller's decommit `os` of `[a, a + n)` in a sparse window (its
@@ -4002,7 +4097,26 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
         HELD.add(HELD_RANGES_WAIT, t0.elapsed().as_micros() as u64);
     }
     let Some(s) = g.as_ref() else { return Vec::new() };
-    s.watched_ranges()
+    let runs = s.watched_ranges();
+    // (local, #877) with the lazily allocated ranges (`alloc_lazy`): a write there is what maps
+    // their tiles
+    if LAZY_ACTIVE.load(Ordering::Acquire) {
+        let lazy = LAZY_RANGES.lock().unwrap();
+        if !lazy.is_empty() {
+            let mut runs = runs;
+            runs.extend(lazy.iter().map(|(&a, &b)| (a, b)));
+            runs.sort_unstable();
+            let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+            for (a, b) in runs {
+                match out.last_mut() {
+                    Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                    _ => out.push((a, b)),
+                }
+            }
+            return out;
+        }
+    }
+    runs
 }
 
 /// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
@@ -4125,6 +4239,34 @@ unsafe fn run_copies(jobs: &mut Vec<(usize, usize, usize)>, staging: *mut u8) {
         });
     }
     jobs.clear();
+}
+
+/// The tiles of lazily allocated ranges (`alloc_lazy`) that get video memory now: those without
+/// it that have a non-zero byte in a page of `dirty` (sorted) inside such a range. Sorted.
+unsafe fn map_lazy_written(s: &mut State, dirty: &[usize], page: usize) -> Vec<usize> {
+    let mut fresh: Vec<usize> = Vec::new();
+    if !LAZY_ACTIVE.load(Ordering::Acquire) {
+        return fresh;
+    }
+    let lazy = LAZY_RANGES.lock().unwrap();
+    if lazy.is_empty() {
+        return fresh;
+    }
+    for &a in dirty {
+        let mut pg = a;
+        while pg < a + page {
+            let t = pg & !(TILE - 1);
+            if fresh.last() != Some(&t) && in_lazy_range(&lazy, pg) && !s.mapped.contains_key(&t) && page_has_nonzero(std::slice::from_raw_parts(pg as *const u8, PAGE)) {
+                let holes = lazy_tile_holes(&lazy, t);
+                s.ensure_mapped(t, TILE, |_| holes);
+                if s.mapped.contains_key(&t) {
+                    fresh.push(t);
+                }
+            }
+            pg += PAGE;
+        }
+    }
+    fresh
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
@@ -4342,6 +4484,10 @@ impl State {
         }
         s.mirror_writes(dirty, page);
         let t_views = stamp();
+        // (local, #877) lazily allocated ranges (`alloc_lazy`): a tile gets video memory with the
+        // first non-zero CPU write to it (before the mappings are sent and the reused tiles
+        // cleared, below)
+        let fresh = map_lazy_written(s, dirty, page);
         // the title's work sees what was committed mapped …
         s.flush_pending();
         PENDING.store(false, Ordering::Release);
@@ -4413,6 +4559,8 @@ impl State {
                 }
             }
         }
+        // (the tile of `fresh` whose pages are taken already)
+        let mut fresh_taken = usize::MAX;
         let mut i = 0;
         while i < dirty.len() {
             let a = dirty[i];
@@ -4429,13 +4577,25 @@ impl State {
                 let t = x & !(TILE - 1);
                 let end = (t + TILE).min(a + n);
                 if let Some(entry) = s.mapped.get_mut(&t).filter(|e| e.src == 0) {
-                    let mut pg = x & !(PAGE - 1);
-                    while pg < end {
-                        let idx = (pg - t) / PAGE;
-                        if entry.holes & (1u16 << idx) == 0 {
-                            pages.push(PageSlot { cpu: pg, win: pg, slot: &mut entry.sent[idx] });
+                    if !fresh.is_empty() && fresh.binary_search(&t).is_ok() {
+                        // mapped just now (`map_lazy_written`): all of it goes up, once
+                        if fresh_taken != t {
+                            fresh_taken = t;
+                            for idx in 0..PAGES_PER_TILE {
+                                if entry.holes & (1u16 << idx) == 0 {
+                                    pages.push(PageSlot { cpu: t + idx * PAGE, win: t + idx * PAGE, slot: &mut entry.sent[idx] });
+                                }
+                            }
                         }
-                        pg += PAGE;
+                    } else {
+                        let mut pg = x & !(PAGE - 1);
+                        while pg < end {
+                            let idx = (pg - t) / PAGE;
+                            if entry.holes & (1u16 << idx) == 0 {
+                                pages.push(PageSlot { cpu: pg, win: pg, slot: &mut entry.sent[idx] });
+                            }
+                            pg += PAGE;
+                        }
                     }
                 }
                 if let Some(over) = s.mirrors.get(&t) {
@@ -6299,6 +6459,27 @@ mod tests {
         early_add(&mut early, a, a + 4 * TILE);
         early_remove(&mut early, a + TILE, a + 2 * TILE);
         assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a, a + TILE), (a + 2 * TILE, a + 4 * TILE)]);
+    }
+
+    #[test]
+    fn lazy_range_helpers_track_tile_overlap_holes_and_nonzero_pages() {
+        let base = 0x5_0000_0000usize;
+        let mut lazy = BTreeMap::new();
+        // Partially cover tile 0 (pages 4..8) and fully cover tile 2.
+        early_add(&mut lazy, base + 4 * PAGE, base + 8 * PAGE);
+        early_add(&mut lazy, base + 2 * TILE, base + 3 * TILE);
+
+        assert!(lazy_overlaps_tile(&lazy, base));
+        assert!(!lazy_overlaps_tile(&lazy, base + TILE));
+        assert!(lazy_overlaps_tile(&lazy, base + 2 * TILE));
+        assert_eq!(lazy_tile_holes(&lazy, base), 0xFFFF & !(0b1111u16 << 4));
+        assert_eq!(lazy_tile_holes(&lazy, base + TILE), 0xFFFF);
+        assert_eq!(lazy_tile_holes(&lazy, base + 2 * TILE), 0);
+
+        let mut page = vec![0u8; PAGE];
+        assert!(!page_has_nonzero(&page));
+        page[PAGE - 1] = 1;
+        assert!(page_has_nonzero(&page));
     }
 
     /// Time for n 64 KiB pages committed one at a time and decommitted one at a time in
