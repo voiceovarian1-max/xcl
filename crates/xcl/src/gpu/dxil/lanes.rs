@@ -21,23 +21,27 @@ impl Lw {
     /// the program's LDS (`lds_words` > 0) and, in the split form, the halves'
     /// exchange words — in the top of the LDS block when there is one (D3D12
     /// allows 32 KB, the whole LDS), as the HLSL kernel lays it out.
-    pub fn setup_storage(&mut self, lds: bool, slot: u32) {
+    /// `fit`: the words of LDS the program allocates (None: all 8192); the array then holds those
+    /// and, in the split form, the exchange words above them.
+    pub fn setup_storage(&mut self, lds: bool, slot: u32, fit: Option<u32>) {
         let i32 = self.s.m.i32();
         self.xslot = slot.max(1);
         if lds {
-            let g = self.s.groupshared("xcl_lds", i32, 8192);
+            let slots = 4 * self.xslot * self.waves;
+            let extra = if self.split { slots + 2 * self.waves + 1 } else { 0 };
+            let total = fit.map_or(8192, |w| (w.max(1) + extra).min(8192));
+            let g = self.s.groupshared("xcl_lds", i32, total as u64);
             self.lds = Some(g);
             if self.split {
                 // HLSL: exchange base = 8192 - slots - counters - 1 (slots = 4 · slot per console
                 // wave, 2 counters each); the program's LDS stops below it
-                let slots = 4 * self.xslot * self.waves;
-                let base = 8192 - slots - 2 * self.waves - 1;
+                let base = total - slots - 2 * self.waves - 1;
                 self.lds_top = base - 1;
                 self.xs = Some((g, base));
                 self.xc = Some((g, base + slots));
-                self.xw = Some((g, 8191));
+                self.xw = Some((g, total - 1));
             } else {
-                self.lds_top = 8191;
+                self.lds_top = total - 1;
             }
         } else if self.split {
             let w = self.s.groupshared("xcl_xw", i32, 1);
@@ -120,7 +124,7 @@ impl Lw {
         } else if y * z > 1 {
             let i32 = self.s.m.i32();
             let (g, at) = match (self.lds, lds_top_word) {
-                (Some(l), true) => (l, 8191),
+                (Some(l), true) => (l, self.lds_top),
                 _ => (self.s.groupshared("xcl_wt", i32, 1), 0),
             };
             let ai = self.c(at);

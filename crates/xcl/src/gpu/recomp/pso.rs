@@ -998,7 +998,7 @@ fn cached_shader(
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
     // (`XCL_SAFE_BARRIER` changes both translators' barriers and which one takes a compute or
     // mesh program, and is not in the translated cache's identity)
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_SAFE_BARRIER", "XCL_DXIL_NO_OPT"]
+    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_SAFE_BARRIER", "XCL_DXIL_NO_OPT", "XCL_DXIL_CONTRACT", "XCL_LDS_FIT"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel

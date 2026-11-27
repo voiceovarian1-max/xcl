@@ -2084,7 +2084,8 @@ impl Lw {
     fn lds_index(&mut self, at: Value) -> Value {
         let i = self.lshrc(at, 2);
         let i = self.andc(i, 8191);
-        if self.split {
+        // (below the exchange words in the split form; inside an array sized to the program's LDS)
+        if self.split || self.lds_top < 8191 {
             let k = self.c(self.lds_top);
             self.umin(i, k)
         } else {

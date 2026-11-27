@@ -3122,7 +3122,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn compute_cs() -> crate::gpu::recomp::CsInterface {
-        crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 }
+        crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1, lds_bytes: 0 }
     }
 
     /// A compute program run on the CPU over `groups` groups (wave32): the memory after.
@@ -3194,7 +3194,7 @@ pub(crate) mod tests {
             }
             mem
         };
-        let cs = |threads: [u32; 3], y: bool| CsInterface { threads, user_sgprs: 2, tgid: [true, y, false], tg_size: false, tid_components: if y { 2 } else { 1 } };
+        let cs = |threads: [u32; 3], y: bool| CsInterface { threads, user_sgprs: 2, tgid: [true, y, false], tg_size: false, tid_components: if y { 2 } else { 1 }, lds_bytes: 0 };
         let limit = |x: u32, y: u32| vec![(IO_THREAD_LIMIT[0], x), (IO_THREAD_LIMIT[1], y)];
         for wave64 in [false, true] {
             let lanes = if wave64 { 64 } else { 32 };

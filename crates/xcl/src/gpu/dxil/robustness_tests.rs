@@ -69,7 +69,7 @@ fn translate_all() -> Vec<Vec<u8>> {
         input_ena: 0x302,
         attrs: None,
     };
-    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1, lds_bytes: 0 };
     let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
     let mut out = Vec::new();
     for (w, s) in [(false, false), (true, true), (true, false)] {
@@ -104,7 +104,7 @@ fn a_group_barrier_of_several_hardware_waves_is_left_to_the_hlsl_path() {
     }
     let code = prog(&[("S_BARRIER", "ENC_SOPP", &[], None)]);
     let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
-    let cs = |threads| CsInterface { threads, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let cs = |threads| CsInterface { threads, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1, lds_bytes: 0 };
     // 16 x 16 threads: 8 hardware waves in the split form, 4 native 64-lane ones, 8 of a
     // 32-lane program; and the two 32-lane halves of one console wave
     for (wave64, split, threads) in [(true, true, [16, 16, 1]), (true, false, [16, 16, 1]), (false, false, [16, 16, 1]), (true, true, [64, 1, 1])] {

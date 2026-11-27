@@ -1454,7 +1454,7 @@ mod fidelity_tests {
         .iter()
         .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
         .collect();
-        let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, lds_bytes: 0 };
         let k = translate_compute(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap();
         if let Err(e) = validate::validate(&k.dxil) {
             panic!("DXIL validation failed: {e}");

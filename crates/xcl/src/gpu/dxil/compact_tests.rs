@@ -209,7 +209,7 @@ fn a_gpu_with_64_lane_waves_keeps_the_first_table_limit() {
     }
     let code = two_segments(8192);
     let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
-    let cs = crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let cs = crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1, lds_bytes: 0 };
     let size = |wave32_only| super::kernel::translate_compute_on(&code, o, &cs, wave32_only).unwrap().dxil.len();
     let (compact, plain) = (size(true), size(false));
     assert!(compact * 20 < plain, "{compact} B on a GPU with 32-lane waves only, {plain} B on one with 64-lane waves");

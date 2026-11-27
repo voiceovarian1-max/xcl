@@ -162,7 +162,7 @@ fn bench_memory_window_accessors() {
         for round in 0..3 {
             for windows in [1, 4] {
                 nonce = nonce.wrapping_mul(0x9E37_79B1) | 1;
-                let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 24, tgid: [false; 3], tg_size: false, tid_components: 1 };
+                let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 24, tgid: [false; 3], tg_size: false, tid_components: 1, lds_bytes: 0 };
                 let t = translate(&program(n, nonce), &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, mem_windows: windows, ..Default::default() })).unwrap();
                 assert!(t.complete(), "{:?}", t.unsupported_why);
                 let forms = if windows == 1 {
@@ -212,7 +212,7 @@ fn linked_programs_keep_their_declarations() {
         let list = [buf("BUFFER_LOAD_DWORD", 2, coherent), buf("BUFFER_STORE_DWORD", 3, false)];
         let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
         let p = prog(&refs);
-        let cs = super::CsInterface { threads: [8, 4, 2], user_sgprs: 16, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let cs = super::CsInterface { threads: [8, 4, 2], user_sgprs: 16, tgid: [false; 3], tg_size: false, tid_components: 1, lds_bytes: 0 };
         let t = translate(&p, &Options { mode: Mode::Compute(cs), wave64, mem_windows: 4, ..Default::default() }).unwrap();
         let size = if wave64 { 64 } else { 32 };
         assert!(t.hlsl.contains(&format!("[WaveSize({size})]")), "{}", t.hlsl);

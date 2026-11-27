@@ -716,7 +716,17 @@ impl Lw {
                 _ => Partner::Spin,
             };
         }
-        lw.setup_storage(uses_lds, if split { slot } else { 1 });
+        // The LDS array sized to what the program allocates (RSRC2 LDS_SIZE), not the whole 32 KB:
+        // groups that ask for little LDS fit many to a GPU core (a retail game's busiest program
+        // allocates 512 B: 32 KB let ~3 of its groups onto an NVIDIA SM, -34 % GPU time per call
+        // with the fit). `XCL_LDS_FIT=0`: always 32 KB, as before (the `ldsfit` variant still fits).
+        let on = crate::gpu::recomp::lds_fit_enabled() || super::module::variant::current() & super::module::variant::LDSFIT != 0;
+        let fit = match entry {
+            Entry::Compute(cs) if cs.lds_bytes > 0 && on => Some(cs.lds_bytes / 4),
+            // (a mesh shader has 28 KB of groupshared memory: always fitted)
+            _ => None,
+        };
+        lw.setup_storage(uses_lds, if split { slot } else { 1 }, fit);
         lw
     }
 
@@ -862,7 +872,7 @@ fn a_split_wave64_compute_program_stays_whole() {
 fn a_dispatch_chain_leaves_the_lanes_past_a_thread_limit_out() {
     use crate::gpu::recomp::{runner, IO_THREAD_LIMIT};
     let threads = [32, 1, 1];
-    let cs = CsInterface { threads, user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads, user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1, lds_bytes: 0 };
     let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
     let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs.clone()));
     let (tid, gtid) = lw.setup_lanes_compute(threads, false);
