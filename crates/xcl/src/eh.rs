@@ -420,6 +420,36 @@ fn rewrite_code(at: usize, new: &[u8]) -> bool {
     true
 }
 
+/// (local) A monitorx / mwaitx across an aligned 8-byte word, which `rewrite_code` leaves: the
+/// byte after its `0F` becomes `1F` (`0F 01 FA/FB` -> `0F 1F FA/FB`, a NOP of the same length),
+/// one atomic byte store, so another thread runs either instruction, never a mix. A retail
+/// title's monitorx sits across a word (+0x4fb0bd7 in its 1.0.2.1 build) and faulted at every
+/// pass of its wait loop, ~3,000 times a second; under Wine a core's worth of exception handling.
+fn rewrite_byte_to_nop(at: usize) {
+    use std::sync::atomic::AtomicU8;
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut old = 0u32;
+    // SAFETY: `at` is a byte of the instruction the processor just fetched; its page is made
+    // writable for the one store and given its protection back
+    unsafe {
+        if VirtualProtect(at as *const c_void, 1, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return;
+        }
+        let _ = (*(at as *const AtomicU8)).compare_exchange(0x01, 0x1F, Ordering::AcqRel, Ordering::Acquire);
+        VirtualProtect(at as *const c_void, 1, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), at as *const c_void, 1);
+    }
+}
+
+/// (local) `code` starts with a monitorx / mwaitx in the NOP form of `rewrite_byte_to_nop`
+/// (`0F 1F FA/FB`, after any prefixes).
+fn is_nop_monitor_wait(code: &[u8]) -> bool {
+    let i = code.iter().position(|&b| !matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF2 | 0xF3 | 0x40..=0x4F)).unwrap_or(code.len());
+    matches!(code.get(i..i + 3), Some([0x0F, 0x1F, 0xFA | 0xFB]))
+}
+
 fn is_writable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     // a committed window of unified memory is read-write as a whole and is not asked about, as in
@@ -497,6 +527,11 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     let n = code_bytes_at(rip, 16);
     let code = std::slice::from_raw_parts(rip as *const u8, n);
     let Some((what, len)) = crate::insn::decode(code) else {
+        // (local) another thread rewrote this monitorx / mwaitx to its one-byte NOP form
+        // (`rewrite_byte_to_nop`) after this one faulted on it: it runs now
+        if is_nop_monitor_wait(code) {
+            return -1;
+        }
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
         return 0;
     };
@@ -529,13 +564,17 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
         // nops, mwaitx `pause` and nops – a wait that ended at once, after which the title
         // checks its own condition again, as it must after any mwaitx.
         ConsoleOnly::Monitorx => {
-            rewrite_code(rip, &[0x90; 16][..len]);
+            if !rewrite_code(rip, &[0x90; 16][..len]) {
+                rewrite_byte_to_nop(rip + len - 2);
+            }
         }
         ConsoleOnly::Mwaitx => {
             std::hint::spin_loop();
             let mut b = [0x90u8; 16];
             b[0] = 0xF3;
-            rewrite_code(rip, &b[..len]);
+            if !rewrite_code(rip, &b[..len]) {
+                rewrite_byte_to_nop(rip + len - 2);
+            }
         }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
@@ -1461,6 +1500,40 @@ mod tests {
                 assert_eq!(std::slice::from_raw_parts((code + at) as *const u8, 3), &after);
             }
         }
+        modules::unregister_mapped(code);
+    }
+
+    /// (local) A monitorx / mwaitx across an aligned 8-byte word gets the one-byte NOP form, and a
+    /// thread whose fault is handled after another thread's rewrite runs on.
+    #[test]
+    fn a_monitorx_across_an_aligned_word_gets_the_one_byte_nop() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        let code = unsafe { VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize };
+        assert_ne!(code, 0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "waits_across.exe".into(), path: "waits_across.exe".into(), base: code, size: 0x1_0000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        // monitorx at +0x17 (bytes 0x17..0x19: across the word at 0x18), mwaitx at +0x2F
+        let cases: [(usize, [u8; 3], [u8; 3]); 2] = [(0x17, [0x0F, 0x01, 0xFA], [0x0F, 0x1F, 0xFA]), (0x2F, [0x0F, 0x01, 0xFB], [0x0F, 0x1F, 0xFB])];
+        for (at, before, after) in cases {
+            unsafe {
+                std::ptr::copy_nonoverlapping(before.as_ptr(), (code + at) as *mut u8, 3);
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                ctx.Rip = (code + at) as u64;
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, (code + at + 3) as u64, "stepped over");
+                assert_eq!(std::slice::from_raw_parts((code + at) as *const u8, 3), &after);
+                // handled after the rewrite: the NOP runs
+                let mut late: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                late.Rip = (code + at) as u64;
+                assert_eq!(emulate_console_only(&mut late), -1);
+                assert_eq!(late.Rip, (code + at) as u64);
+            }
+        }
+        assert!(!is_nop_monitor_wait(&[0x0F, 0x1F, 0x00]) && is_nop_monitor_wait(&[0xF3, 0x0F, 0x1F, 0xFA]));
         modules::unregister_mapped(code);
     }
 
