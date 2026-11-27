@@ -65,6 +65,18 @@ struct State {
     limits: [u32; 3],
     /// the count check's buffer was left INDIRECT_ARGUMENT in this recording (`indirect_guard`)
     guard_out_ia: bool,
+    /// (local) the open batch of one-pass ExecuteIndirect arguments (`batched_args`)
+    arg_batch: Option<ArgBatch>,
+}
+
+/// (local) A pass that rewrites the arguments of many one-pass ExecuteIndirects (`batched_args`):
+/// its table of jobs (UMA address), the jobs in it, and its block of rewritten arguments.
+struct ArgBatch {
+    table: usize,
+    jobs: u32,
+    dst: ID3D12Resource,
+    base: u64,
+    used: u64,
 }
 
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
@@ -447,7 +459,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.heaps = [0; 2];
         // (the scratch blocks are in `res_retired` already)
         (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open) = (None, 0, 0, false, None);
-        s.guard_out_ia = false;
+        (s.guard_out_ia, s.arg_batch) = (false, None);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -506,7 +518,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         // the two-pass record buffers and argument scratch of `to`'s previous recording, as in
         // `reset`: the GPU may still read them, so the new one takes fresh ones
         (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open) = (None, 0, 0, false, None);
-        s.guard_out_ia = false;
+        (s.guard_out_ia, s.arg_batch) = (false, None);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -2013,6 +2025,195 @@ fn scratch_state(in_args: bool) -> D3D12_RESOURCE_STATES {
     } else {
         D3D12_RESOURCE_STATE_COMMON
     }
+}
+
+/// (local, after cool_fox by codec_d, https://github.com/DoubleGhosty/cool_fox f4b48ad, `crates/victory-gpu/src/indirect/batch.rs`; GPL-3.0-or-later)
+/// One pass rewrites the arguments of the one-pass ExecuteIndirects between two points where they
+/// may change (a title barrier, flush or copy: `close_arg_batch`), recorded at the first of them.
+/// It reads what to rewrite from a table in unified memory that the CPU goes on filling while the
+/// list is recorded (threads past its count do nothing) and writes into a scratch block left
+/// INDIRECT_ARGUMENT, so the draws after it take no pass or barrier of their own
+/// (`make_scaled_args_buffer`: a pass, a UAV barrier and two transitions each). A job (8 words):
+/// source window | count window << 4 | has count << 8, source offset, commands, stride, the
+/// DispatchMesh argument's offset, count offset, destination offset, most groups (bit 9 of the
+/// first word: two copies, the mesh pass's with `split` (bits 16-31) times the groups). Each command
+/// is copied with its groups in X (`SCALE_ARGS_HLSL`); past the count it gets none.
+/// `XCL_ARG_BATCH=0`: a pass for each.
+pub(super) const BATCH_ARGS_HLSL: &str = r#"#define RS "UAV(u0), UAV(u1), UAV(u2), UAV(u3), UAV(u4), UAV(u5), UAV(u6), UAV(u7), UAV(u8), UAV(u9)"
+RWByteAddressBuffer jobs : register(u0);
+RWByteAddressBuffer dst : register(u1);
+RWByteAddressBuffer w0 : register(u2);
+RWByteAddressBuffer w1 : register(u3);
+RWByteAddressBuffer w2 : register(u4);
+RWByteAddressBuffer w3 : register(u5);
+RWByteAddressBuffer w4 : register(u6);
+RWByteAddressBuffer w5 : register(u7);
+RWByteAddressBuffer w6 : register(u8);
+RWByteAddressBuffer w7 : register(u9);
+uint ld(uint w, uint a) {
+    [branch] switch (w) {
+    case 0u: return w0.Load(a);
+    case 1u: return w1.Load(a);
+    case 2u: return w2.Load(a);
+    case 3u: return w3.Load(a);
+    case 4u: return w4.Load(a);
+    case 5u: return w5.Load(a);
+    case 6u: return w6.Load(a);
+    default: return w7.Load(a);
+    }
+}
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint tid : SV_DispatchThreadID) {
+    if (tid >= jobs.Load(0)) return;
+    uint4 a = jobs.Load4(16u + tid * 32u), b = jobs.Load4(32u + tid * 32u);
+    uint sw = a.x & 15u, cw = (a.x >> 4) & 15u, two = (a.x >> 9) & 1u, split = a.x >> 16;
+    uint src = a.y, count = a.z, stride = a.w, off = b.x, d = b.z, cap = b.w;
+    uint live = ((a.x >> 8) & 1u) != 0u ? min(count, ld(cw, b.y)) : count;
+    for (uint c = 0u; c < count; c++) {
+        uint s = src + c * stride, o = d + c * stride, m = o + count * stride;
+        for (uint i = 0u; i < stride; i += 4u) {
+            uint w = ld(sw, s + i);
+            dst.Store(o + i, w);
+            if (two != 0u) dst.Store(m + i, w);
+        }
+        uint3 g = uint3(ld(sw, s + off), ld(sw, s + off + 4u), ld(sw, s + off + 8u));
+        uint n = 0u;
+        if (c < live && g.x != 0u && g.y != 0u && g.z != 0u) {
+            n = min(g.x, cap);
+            n = g.y > cap / n ? cap : n * g.y;
+            n = g.z > cap / n ? cap : n * g.z;
+        }
+        dst.Store3(o + off, uint3(n, 1u, 1u));
+        if (two != 0u) dst.Store3(m + off, uint3(n * split, 1u, 1u));
+    }
+}
+"#;
+const BATCH_JOBS: u32 = 256;
+const BATCH_TABLE: usize = 16 + BATCH_JOBS as usize * 32;
+/// bytes of a batch's block of rewritten arguments
+const BATCH_DST: u64 = 16 << 10;
+/// most commands of one ExecuteIndirect a batch takes (more: a pass of its own)
+const BATCH_MAX_COMMANDS: u32 = 64;
+
+fn arg_batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_ARG_BATCH").map_or(true, |v| v.trim() != "0"))
+}
+
+/// (local) The title may have changed what ExecuteIndirects read: the next one opens a batch.
+pub(super) fn close_arg_batch(list: *mut c_void) {
+    with(list, |s| s.arg_batch = None);
+}
+
+unsafe fn batch_args_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    // (one for each thread, as `scale_indirect_pipeline`)
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>> = std::cell::RefCell::new(HashMap::new());
+    }
+    let key = dev.as_raw() as usize;
+    if let Some(pair) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(pair);
+    }
+    let dxil = crate::gpu::recomp::dxc::compile_cached(BATCH_ARGS_HLSL, "main", "cs_6_6")?.0;
+    let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).map_err(|e| format!("batch root signature: {e}"))?;
+    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
+        ..Default::default()
+    };
+    let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
+    std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
+    let pso = res_pso.map_err(|e| format!("batch pso create: {e}"))?;
+    CACHE.with(|c| c.borrow_mut().insert(key, (rs.clone(), pso.clone())));
+    Ok((rs, pso))
+}
+
+/// Records a batch's pass (`BATCH_ARGS_HLSL`) on `list`, its table empty.
+unsafe fn open_arg_batch(this: *mut c_void, list: &ID3D12GraphicsCommandList) -> Result<ArgBatch, String> {
+    let dev = super::real::list_device(this).ok_or("no device")?;
+    let (rs, pso) = batch_args_pipeline(&dev)?;
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    let p = with(this, |s| s.arena.take(u, BATCH_TABLE, 256, &mut s.uma)).ok_or("unified memory is full")?;
+    (p as *mut u32).write_volatile(0);
+    let table_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
+    let first = (0..8).find_map(|k| super::real::uma_window_va(k).filter(|&v| v != 0)).ok_or("no memory window")?;
+    let (dst, base) = scratch_args(this, &dev, BATCH_DST)?;
+    // the title's writes of the arguments before this, as `make_scaled_args_buffer`
+    let before = scratch_state(with(this, |s| s.scratch_in_args));
+    emit_uav_and_transition(list, None, &dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list.SetComputeRootSignature(&rs);
+    list.SetPipelineState(&pso);
+    list.SetComputeRootUnorderedAccessView(0, table_va);
+    list.SetComputeRootUnorderedAccessView(1, dst.GetGPUVirtualAddress());
+    for k in 0..8u32 {
+        list.SetComputeRootUnorderedAccessView(2 + k, super::real::uma_window_va(k as usize).filter(|&v| v != 0).unwrap_or(first));
+    }
+    list.Dispatch(BATCH_JOBS / 64, 1, 1);
+    emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    with(this, |s| s.scratch_in_args = true);
+    Ok(ArgBatch { table: p as usize, jobs: 0, dst, base, used: 0 })
+}
+
+/// (local) `make_scaled_args_buffer` through the list's open batch: the block and where the
+/// rewritten commands are (`split`: two copies, as two passes read them; None: one, for one pass).
+/// None: not one a batch takes (it then takes a pass of its own).
+#[allow(clippy::too_many_arguments)]
+unsafe fn batched_args(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: Option<u32>, cap: u32) -> Option<(ID3D12Resource, u64)> {
+    if !arg_batch_on() || max == 0 || max > BATCH_MAX_COMMANDS || stride % 4 != 0 || mesh_offset % 4 != 0 || split.is_some_and(|n| n == 0 || n > 0xFFFF) {
+        return None;
+    }
+    let u = crate::gpu::uma::get()?;
+    // (the window and the offset in it of `n` bytes at `p`)
+    let at = |p: usize, n: usize| -> Option<(u32, u32)> {
+        let k = u.window_of(p)?;
+        let (base, size) = u.window(k);
+        (k < 8 && p - base + n <= size && (p - base) % 4 == 0).then_some(())?;
+        Some((k as u32, u32::try_from(p - base).ok()?))
+    };
+    let commands = max as u64 * stride as u64;
+    // (only the GPU reads them: in a GPU view too, once its tiles are asked for – as `prepare_scaled_args`)
+    want_view(super::view_want::Path::MemoryOp, src as u64, commands);
+    let (sw, so) = at(src, commands as usize)?;
+    let (cw, co, has) = match count {
+        Some(p) => {
+            want_view(super::view_want::Path::MemoryOp, p as u64, 4);
+            let (w, o) = at(p, 4)?;
+            (w, o, 1u32)
+        }
+        None => (0, 0, 0),
+    };
+    let bytes = (commands * if split.is_some() { 2 } else { 1 }).next_multiple_of(16);
+    if bytes > BATCH_DST {
+        return None;
+    }
+    if !with(this, |s| s.arg_batch.as_ref().is_some_and(|b| b.jobs < BATCH_JOBS && b.used + bytes <= BATCH_DST)) {
+        match open_arg_batch(this, list) {
+            Ok(b) => with(this, |s| s.arg_batch = Some(b)),
+            Err(e) => {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!("D3D12.X: one-pass ExecuteIndirect arguments not batched: {e}");
+                }
+                return None;
+            }
+        }
+    }
+    with(this, |s| {
+        let b = s.arg_batch.as_mut()?;
+        let at = b.base + b.used;
+        let two = split.map_or(0, |n| 1 << 9 | n << 16);
+        let job = [sw | cw << 4 | has << 8 | two, so, max, stride, mesh_offset, co, at as u32, cap];
+        let t = b.table as *mut u32;
+        for (i, w) in job.iter().enumerate() {
+            t.add(4 + 8 * b.jobs as usize + i).write_volatile(*w);
+        }
+        b.jobs += 1;
+        // (the count last: the job is whole before the pass can see it)
+        t.write_volatile(b.jobs);
+        b.used += bytes;
+        Some((b.dst.clone(), at))
+    })
 }
 
 /// What a DispatchMesh or ExecuteIndirect draws with, decided once from `resolved`, what
@@ -3613,6 +3814,18 @@ mod tests {
         pso_async::released(built);
         pso_async::released(failed);
         assert!(!pso_async::is_pending(building));
+    }
+
+    /// (local) The batch pass of one-pass ExecuteIndirect arguments compiles with the root
+    /// signature it is made with (`batch_args_pipeline`: from its DXIL).
+    #[test]
+    fn batch_args_program_compiles_with_its_root_signature() {
+        if crate::gpu::recomp::dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let dxil = crate::gpu::recomp::dxc::compile(super::BATCH_ARGS_HLSL, "main", "cs_6_6", &[]).unwrap();
+        assert!(dxil.windows(4).any(|w| w == b"RTS0"), "no root signature part");
     }
 
     /// A dispatch writes an ExecuteIndirect's group count through another buffer over the same

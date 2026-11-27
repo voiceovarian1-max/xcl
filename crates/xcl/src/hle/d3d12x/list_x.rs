@@ -2625,6 +2625,7 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
+    super::bind::close_arg_batch(this);
     let refused = size == 0 || !size.is_multiple_of(4);
     let _c = super::capture::op(this, || {
         use super::capture as c;
@@ -3639,6 +3640,8 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
 pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+    // (local) what ExecuteIndirects read may change past it (`bind::batched_args`)
+    super::bind::close_arg_batch(this);
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -4882,6 +4885,8 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         return;
     }
     let capture = super::capture::op(this, || Some(super::capture::barrier(&(0..n as usize).map(|k| barriers.add(k).read_unaligned()).collect::<Vec<_>>())));
+    // (local) what ExecuteIndirects read may change past it (`bind::batched_args`)
+    super::bind::close_arg_batch(this);
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);
