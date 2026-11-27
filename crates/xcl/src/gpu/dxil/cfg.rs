@@ -131,6 +131,8 @@ impl Cfg {
         // CFG; the console compiler emits loops entered in the middle): split nodes until
         // every retreating edge is a back edge to a dominator
         let (post, headers) = make_reducible(&mut blocks)?;
+        single_latch(&mut blocks, &post, &headers);
+        let (post, headers) = order(&blocks);
         let succ = succ_of;
         let reach: BTreeSet<usize> = post.iter().copied().collect();
         for &b in &post {
@@ -255,6 +257,41 @@ pub fn loop_parents(cfg: &Cfg) -> BTreeMap<usize, Option<usize>> {
             (h, around)
         })
         .collect()
+}
+
+/// One back edge per loop head and per block: a head with several, or one whose back edge
+/// leaves a block that has a second, gets a new block that jumps to it and takes them.
+/// vkd3d-proton's dxil-spirv assumes this where it handles wave shuffles and overflows its
+/// stack otherwise (#1805: 77 of the title's 2,682 compute programs).
+fn single_latch(blocks: &mut Vec<CfgBlock>, rpo: &[usize], headers: &BTreeSet<usize>) {
+    let mut pos = vec![usize::MAX; blocks.len()];
+    for (i, &b) in rpo.iter().enumerate() {
+        pos[b] = i;
+    }
+    let back_edges = |b: &CfgBlock, p: usize| succ_of(b).into_iter().filter(|&t| pos[t] <= pos[p]).count();
+    let twice: Vec<bool> = (0..blocks.len()).map(|p| pos[p] != usize::MAX && back_edges(&blocks[p], p) > 1).collect();
+    for &h in headers {
+        let back: Vec<usize> = rpo.iter().copied().filter(|&p| pos[p] >= pos[h] && succ_of(&blocks[p]).contains(&h)).collect();
+        if back.len() < 2 && !back.iter().any(|&p| twice[p]) {
+            continue;
+        }
+        let latch = blocks.len();
+        blocks.push(CfgBlock { pc: blocks[h].pc, insts: Vec::new(), term: Term::Jump(h), preds: Vec::new() });
+        for p in back {
+            match &mut blocks[p].term {
+                Term::Jump(x) => *x = latch,
+                Term::Cond(_, x, y) => {
+                    if *x == h {
+                        *x = latch
+                    }
+                    if *y == h {
+                        *y = latch
+                    }
+                }
+                Term::End => {}
+            }
+        }
+    }
 }
 
 fn succ_of(b: &CfgBlock) -> Vec<usize> {
@@ -444,5 +481,42 @@ mod tests {
     fn loop_parents_of_a_loop_at_the_entry() {
         let b = vec![blk(Jump(1)), blk(Cond(0, 1, 2)), blk(Cond(0, 0, 3)), blk(End)];
         assert_eq!(parents(b), [(0, None), (1, Some(0))]);
+    }
+
+    /// A loop with two ways back to its head (a `continue` and the loop's end): 0 → 1,
+    /// 1 → {2 | 4}, 2 → {1 | 3}, 3 → 1. Both go through one latch block afterwards.
+    #[test]
+    fn two_back_edges_share_a_latch() {
+        let mut b = vec![blk(Term::Jump(1)), blk(Term::Cond(0, 2, 4)), blk(Term::Cond(0, 1, 3)), blk(Term::Jump(1)), blk(Term::End)];
+        let (rpo, headers) = order(&b);
+        single_latch(&mut b, &rpo, &headers);
+        let (rpo, headers) = order(&b);
+        assert_eq!(b.len(), 6);
+        assert_eq!(b[5].term, Term::Jump(1));
+        assert_eq!(headers, BTreeSet::from([1]));
+        let back: Vec<usize> = rpo.iter().copied().filter(|&p| p != 0 && succ_of(&b[p]).contains(&1)).collect();
+        assert_eq!(back, [5]);
+        // a loop with one back edge is left as it is
+        let mut one = vec![blk(Term::Jump(1)), blk(Term::Cond(0, 1, 2)), blk(Term::End)];
+        let (rpo, headers) = order(&one);
+        single_latch(&mut one, &rpo, &headers);
+        assert_eq!(one.len(), 3);
+    }
+
+    /// A block that goes back to the inner loop's head or to the outer one's: 0 → 1 → 2,
+    /// 2 → {3 | 4}, 3 → {2 | 1}. Each head gets a latch, so no block has two back edges.
+    #[test]
+    fn a_block_keeps_one_back_edge() {
+        let mut b = vec![blk(Term::Jump(1)), blk(Term::Jump(2)), blk(Term::Cond(0, 3, 4)), blk(Term::Cond(0, 2, 1)), blk(Term::End)];
+        let (rpo, headers) = order(&b);
+        single_latch(&mut b, &rpo, &headers);
+        let (rpo, headers) = order(&b);
+        assert_eq!(b.len(), 7);
+        assert_eq!(headers, BTreeSet::from([1, 2]));
+        let mut pos = vec![0; b.len()];
+        for (i, &x) in rpo.iter().enumerate() {
+            pos[x] = i;
+        }
+        assert!(rpo.iter().all(|&p| succ_of(&b[p]).into_iter().filter(|&t| pos[t] <= pos[p]).count() <= 1));
     }
 }
