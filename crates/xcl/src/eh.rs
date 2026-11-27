@@ -387,6 +387,39 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Rewrites the code bytes at `at` with `new` when they lie inside one aligned 8-byte word: one
+/// atomic store, so another thread at the same instruction runs either the old one (and comes
+/// back here) or the new one, never a mix. Otherwise the code is left as it is and the
+/// instruction stays emulated. Whether it was rewritten.
+fn rewrite_code(at: usize, new: &[u8]) -> bool {
+    use std::sync::atomic::AtomicU64;
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let word = at & !7;
+    let off = at - word;
+    if new.is_empty() || off + new.len() > 8 {
+        return false;
+    }
+    let mut old = 0u32;
+    // SAFETY: `word` is the aligned word around code the processor just fetched; it is made
+    // writable for the one store and given its protection back
+    unsafe {
+        if VirtualProtect(word as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        let cell = &*(word as *const AtomicU64);
+        let was = cell.load(Ordering::Acquire);
+        let mut bytes = was.to_le_bytes();
+        bytes[off..off + new.len()].copy_from_slice(new);
+        // another thread may have rewritten it first: then it holds the same bytes already
+        let _ = cell.compare_exchange(was, u64::from_le_bytes(bytes), Ordering::AcqRel, Ordering::Acquire);
+        VirtualProtect(word as *const c_void, 8, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), word as *const c_void, 8);
+    }
+    true
+}
+
 fn is_writable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     // a committed window of unified memory is read-write as a whole and is not asked about, as in
@@ -464,10 +497,6 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     let n = code_bytes_at(rip, 16);
     let code = std::slice::from_raw_parts(rip as *const u8, n);
     let Some((what, len)) = crate::insn::decode(code) else {
-        // (local) another thread rewrote this MONITORX / MWAITX to its NOP after this one trapped
-        if is_patched_monitor_wait(code) {
-            return -1;
-        }
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
         return 0;
     };
@@ -494,17 +523,19 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
             }
         }
-        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
-            // Rewritten in place at the first trap: `0F 01 FA/FB` -> `0F 1F FA/FB`, a NOP. One byte
-            // changes, so another thread runs either instruction, never a mix of them; the title's
-            // wait loop around them polls its memory itself. A retail title's loop trapped ~6,000
-            // times a second, a core's worth of exception handling under Wine.
-            // `XCL_MWAITX_PATCH=0`: emulated at every pass, as before.
-            static PATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let patch = *PATCH.get_or_init(|| std::env::var("XCL_MWAITX_PATCH").map_or(true, |v| v.trim() != "0"));
-            if !(patch && patch_byte(rip + len - 2, 0x01, 0x1F)) && what == ConsoleOnly::Mwaitx {
-                std::hint::spin_loop();
-            }
+        // A title that paces itself with monitorx / mwaitx spins on them: tens of thousands of
+        // faults a second on a CPU without them. Each is rewritten in place at its first fault
+        // (`rewrite_code`), so the title's loop runs natively from then on: monitorx becomes
+        // nops, mwaitx `pause` and nops – a wait that ended at once, after which the title
+        // checks its own condition again, as it must after any mwaitx.
+        ConsoleOnly::Monitorx => {
+            rewrite_code(rip, &[0x90; 16][..len]);
+        }
+        ConsoleOnly::Mwaitx => {
+            std::hint::spin_loop();
+            let mut b = [0x90u8; 16];
+            b[0] = 0xF3;
+            rewrite_code(rip, &b[..len]);
         }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
@@ -590,33 +621,6 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     }
     ctx.Rip += step as u64;
     -1 // EXCEPTION_CONTINUE_EXECUTION
-}
-
-/// `code` starts with a MONITORX / MWAITX that `patch_byte` turned into its NOP (`0F 1F FA/FB`
-/// after any prefixes).
-fn is_patched_monitor_wait(code: &[u8]) -> bool {
-    let i = code.iter().position(|&b| !matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF2 | 0xF3 | 0x40..=0x4F)).unwrap_or(code.len());
-    matches!(code.get(i..i + 3), Some([0x0F, 0x1F, 0xFA | 0xFB]))
-}
-
-/// The code byte at `at` changed from `from` to `to` (one atomic store; the page writable for it):
-/// whether it holds `to` now.
-unsafe fn patch_byte(at: usize, from: u8, to: u8) -> bool {
-    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut old = 0u32;
-    if VirtualProtect(at as *const std::ffi::c_void, 1, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
-        return false;
-    }
-    let byte = &*(at as *const std::sync::atomic::AtomicU8);
-    let done = match byte.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => true,
-        Err(now) => now == to,
-    };
-    VirtualProtect(at as *const std::ffi::c_void, 1, old, &mut old);
-    FlushInstructionCache(GetCurrentProcess(), at as *const std::ffi::c_void, 1);
-    done
 }
 
 unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -1211,6 +1215,48 @@ mod tests {
         assert_eq!(find_gs_check(&[0x48; 64]), None);
     }
 
+    /// monitorx / mwaitx are emulated once and rewritten in place: nops, and `pause` + nops.
+    #[test]
+    fn monitorx_and_mwaitx_are_rewritten_at_their_first_fault() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        let code = unsafe { VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize };
+        assert_ne!(code, 0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "waits.exe".into(), path: "waits.exe".into(), base: code, size: 0x1_0000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        // monitorx at +0x10, mwaitx at +0x20: inside an aligned word each
+        let cases: [(usize, [u8; 3], [u8; 3]); 2] = [(0x10, [0x0F, 0x01, 0xFA], [0x90, 0x90, 0x90]), (0x20, [0x0F, 0x01, 0xFB], [0xF3, 0x90, 0x90])];
+        for (at, before, after) in cases {
+            unsafe {
+                std::ptr::copy_nonoverlapping(before.as_ptr(), (code + at) as *mut u8, 3);
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                ctx.Rip = (code + at) as u64;
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, (code + at + 3) as u64);
+                assert_eq!(std::slice::from_raw_parts((code + at) as *const u8, 3), &after);
+            }
+        }
+        modules::unregister_mapped(code);
+    }
+
+    /// Bytes across an aligned 8-byte word are left as they are (the instruction stays emulated).
+    #[test]
+    fn code_across_an_aligned_word_is_not_rewritten() {
+        let mut buf = [0xCCu8; 24];
+        let base = (buf.as_mut_ptr() as usize + 7) & !7;
+        let at = base + 6;
+        unsafe { std::ptr::copy_nonoverlapping([0x0F, 0x01, 0xFA].as_ptr(), at as *mut u8, 3) };
+        assert!(!rewrite_code(at, &[0x90; 3]));
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 3) }, &[0x0F, 0x01, 0xFA]);
+        let inside = base + 8;
+        unsafe { std::ptr::copy_nonoverlapping([0x0F, 0x01, 0xFA].as_ptr(), inside as *mut u8, 3) };
+        assert!(rewrite_code(inside, &[0x90; 3]));
+        assert_eq!(unsafe { std::slice::from_raw_parts(inside as *const u8, 3) }, &[0x90; 3]);
+    }
+
     /// `67 0F 01 FC`: CLZERO at EAX. rax's upper half set, and memory mapped at both the 64- and
     /// the 32-bit address: only the 32-bit one's line is zeroed.
     #[test]
@@ -1241,41 +1287,6 @@ mod tests {
                 assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
             }
         }
-        modules::unregister_mapped(code);
-    }
-
-    /// MONITORX / MWAITX become NOPs at their first trap (one byte each), and a thread that
-    /// trapped before the rewrite runs the NOP again.
-    #[test]
-    fn monitorx_and_mwaitx_are_rewritten_to_nops_at_the_first_trap() {
-        use std::sync::{atomic::AtomicBool, Arc};
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
-        let code = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
-        assert_ne!(code, 0);
-        modules::register_mapped(Arc::new(modules::MappedModule {
-            name: "mwaitx_test.exe".into(), path: "mwaitx_test.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
-            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
-            initialized: AtomicBool::new(true), stack_reserve: 0,
-        }));
-        unsafe {
-            // monitorx; mwaitx; a prefixed mwaitx
-            let bytes = [0x0Fu8, 0x01, 0xFA, 0x0F, 0x01, 0xFB, 0x66, 0x0F, 0x01, 0xFB];
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), code as *mut u8, bytes.len());
-            for (at, len) in [(0usize, 3u64), (3, 3), (6, 4)] {
-                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
-                ctx.Rip = (code + at) as u64;
-                assert_eq!(emulate_console_only(&mut ctx), -1);
-                assert_eq!(ctx.Rip, (code + at) as u64 + len, "stepped over");
-            }
-            let now = std::slice::from_raw_parts(code as *const u8, bytes.len());
-            assert_eq!(now, &[0x0F, 0x1F, 0xFA, 0x0F, 0x1F, 0xFB, 0x66, 0x0F, 0x1F, 0xFB]);
-            // a thread that trapped at the old bytes and is handled after the rewrite: run again
-            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
-            ctx.Rip = (code + 6) as u64;
-            assert_eq!(emulate_console_only(&mut ctx), -1);
-            assert_eq!(ctx.Rip, (code + 6) as u64, "the NOP runs");
-        }
-        assert!(!is_patched_monitor_wait(&[0x0F, 0x1F, 0x00]) && is_patched_monitor_wait(&[0xF3, 0x0F, 0x1F, 0xFA]));
         modules::unregister_mapped(code);
     }
 
