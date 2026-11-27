@@ -1856,9 +1856,15 @@ void main(uint tid : SV_DispatchThreadID) {
 "#;
 
 unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
-    static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
+    // (local) one pipeline for each thread: under Wine an object's own vtable is put back while
+    // it is handed to vkd3d-proton (`UnadoptGuard`, upstream PR #867), and a release of the one
+    // pipeline all recording threads shared found it so (`pso_release`, a fault three runs ended in)
+    // PORT-CHECK: a deferred draw's `Rewrite` names the pair by address; it lives as long as the thread
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>> = std::cell::RefCell::new(HashMap::new());
+    }
     let key = dev.as_raw() as usize;
-    if let Some(pair) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
+    if let Some(pair) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return Ok(pair);
     }
     let dxil = crate::gpu::recomp::dxc::compile_cached(SCALE_ARGS_HLSL, "main", "cs_6_6")?.0;
@@ -1871,7 +1877,7 @@ unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
     let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
     std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
     let pso = res_pso.map_err(|e| format!("scale pso create: {e}"))?;
-    CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
+    CACHE.with(|c| c.borrow_mut().insert(key, (rs.clone(), pso.clone())));
     Ok((rs, pso))
 }
 
