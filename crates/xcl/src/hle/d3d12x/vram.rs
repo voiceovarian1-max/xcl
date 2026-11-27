@@ -1225,7 +1225,7 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
         if newly_reclaimed.is_empty() && !map.contains_key(&dev_key) { return; }
         let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
         let before = rq.batches.len();
-        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok());
+        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || super::real::create_raw_fence(dev).ok(), |q, f, v| q.Signal(f, v).is_ok());
         // (`fence_completed`: XCL's own fences, without the title's hook)
         let (done, pruned) = rq.sweep_with(&live_keys, |f| super::real::fence_completed(f));
         RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);

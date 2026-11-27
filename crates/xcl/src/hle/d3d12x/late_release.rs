@@ -69,7 +69,7 @@ impl Held {
                 let key = q.as_raw() as usize;
                 if !self.fences.contains_key(&key) {
                     let mut dev: Option<ID3D12Device> = None;
-                    let made = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok());
+                    let made = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| super::real::create_raw_fence(&d).ok());
                     let Some(f) = made else {
                         ok = false;
                         break;

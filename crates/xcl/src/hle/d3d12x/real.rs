@@ -861,6 +861,65 @@ pub(super) unsafe fn readopt(obj: *mut c_void, kind: Kind) {
     *(obj as *mut usize) = class_for(obj, orig, kind);
 }
 
+/// Temporarily restores an adopted object's native vtable for a call into `d3d12core.dll`
+/// (vkd3d-proton validates `iface->lpVtbl` on command allocators and command lists).
+pub(crate) struct UnadoptGuard {
+    obj: *mut c_void,
+    ext: usize,
+}
+
+/// Objects whose native vtable is in place for calls in flight: the extended one, and how many
+/// guards hold it. (local) Without it two threads binding one pipeline at once raced: the second
+/// found the native vtable where it expected the extended one, took the word before the PC's
+/// vtable for the "native" one and wrote it into the object – a retail game's world crashed in
+/// `enter` on a vtable pointer of 0 once its threads ran faster.
+static UNADOPTED: Mutex<Option<HashMap<usize, (usize, u32)>>> = Mutex::new(None);
+
+impl UnadoptGuard {
+    pub(crate) unsafe fn new(obj: *mut c_void) -> Option<Self> {
+        if obj.is_null() || !crate::util::under_wine() {
+            return None;
+        }
+        let mut g = UNADOPTED.lock().unwrap();
+        let held = g.get_or_insert_with(HashMap::new);
+        (held.contains_key(&(obj as usize)) || is_adopted(obj)).then(|| Self::hold(held, obj))
+    }
+
+    /// (tests) the same without asking whether `obj` is adopted
+    #[cfg(test)]
+    unsafe fn enter(obj: *mut c_void) -> Self {
+        Self::hold(UNADOPTED.lock().unwrap().get_or_insert_with(HashMap::new), obj)
+    }
+
+    unsafe fn hold(held: &mut HashMap<usize, (usize, u32)>, obj: *mut c_void) -> Self {
+        if let Some(e) = held.get_mut(&(obj as usize)) {
+            e.1 += 1;
+            return Self { obj, ext: e.0 };
+        }
+        let ext = *(obj as *const usize);
+        let orig = *(ext as *const usize).sub(1);
+        *(obj as *mut usize) = orig;
+        held.insert(obj as usize, (ext, 1));
+        Self { obj, ext }
+    }
+}
+
+impl Drop for UnadoptGuard {
+    fn drop(&mut self) {
+        let mut g = UNADOPTED.lock().unwrap();
+        let Some(held) = g.as_mut() else { return };
+        if let Some(e) = held.get_mut(&(self.obj as usize)) {
+            e.1 -= 1;
+            if e.1 == 0 {
+                held.remove(&(self.obj as usize));
+                unsafe {
+                    *(self.obj as *mut usize) = self.ext;
+                }
+            }
+        }
+    }
+}
+
 /// Give a genuine D3D12 object the extended vtable for `kind`.
 pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     if obj.is_null() {
@@ -3359,7 +3418,12 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("Close", cl_close as usize),
             ("Reset", cl_reset as usize),
         ]),
-        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
+        Kind::CommandQueue => v.extend_from_slice(&[
+            ("Release", q_release as usize),
+            ("ExecuteCommandLists", q_execute_command_lists as usize),
+            ("Signal", q_signal_pc as usize),
+            ("Wait", q_wait_pc as usize),
+        ]),
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
         Kind::Resource => v.extend_from_slice(&[
             ("Release", res_release as usize),
@@ -3446,7 +3510,11 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "Reset")));
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
-    let hr = f(this, allocator, resolved);
+    let hr = {
+        let _alloc_guard = UnadoptGuard::new(allocator);
+        let _pso_guard = UnadoptGuard::new(resolved);
+        f(this, allocator, resolved)
+    };
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
@@ -3629,7 +3697,12 @@ fn is_own_object(kind: Kind) -> bool {
 creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);
 creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [a1, a2]);
 creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
-creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+creator!(dev_create_command_list_inner, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+pub(super) unsafe extern "system" fn dev_create_command_list(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _alloc_guard = UnadoptGuard::new(a3 as *mut c_void);
+    let _pso_guard = UnadoptGuard::new(a4 as *mut c_void);
+    dev_create_command_list_inner(this, a1, a2, a3, a4, riid, ppv)
+}
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
 
 /// Create a raw adopted PC `ID3D12GraphicsCommandList` without wrapping it in `title_list`
@@ -3651,6 +3724,8 @@ pub(super) unsafe fn create_raw_pc_command_list(
         type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
         let slot = layout::slot(layout::find("ID3D12Device")?, "CreateCommandList")?;
         let f: F = std::mem::transmute(*vt(dev).add(slot));
+        let _alloc_guard = UnadoptGuard::new(alloc as *mut c_void);
+        let _pso_guard = UnadoptGuard::new(init_pso as *mut c_void);
         let hr = f(dev, 0, ty, alloc, init_pso, &iid, &mut out);
         if hr >= 0 && !out.is_null() {
             adopt(out, Kind::CommandList);
@@ -3663,7 +3738,11 @@ creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHea
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
 creator!(dev_create_committed_resource2, "CreateCommittedResource2", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
-creator!(dev_create_placed_resource, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
+creator!(dev_create_placed_resource_inner, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
+pub(super) unsafe extern "system" fn dev_create_placed_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _heap_guard = UnadoptGuard::new(a1 as *mut c_void);
+    dev_create_placed_resource_inner(this, a1, a2, a3, a4, a5, riid, ppv)
+}
 
 /// D3D12_RESOURCE_STATES the PC knows (as `list_x::PC_STATES`)
 pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0xF_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000 | 0x100_0000;
@@ -3826,7 +3905,11 @@ unsafe fn pc_allocation_size(device: *mut c_void, d: &[u8; 0x38]) -> u64 {
     f(device, &mut r, 0, 1, &safe);
     r[0]
 }
-creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
+creator!(dev_create_placed_resource1_inner, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
+unsafe extern "system" fn dev_create_placed_resource1(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _heap_guard = UnadoptGuard::new(a1 as *mut c_void);
+    dev_create_placed_resource1_inner(this, a1, a2, a3, a4, a5, riid, ppv)
+}
 creator!(pc_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
 creator!(pc_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
 
@@ -4053,6 +4136,108 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
 }
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
+/// Thin COM proxy around `ID3D12Fence1` used under Wine/vkd3d-proton so the underlying
+/// fence's native `lpVtbl` stays intact (`vkd3d-proton` compares `fence->lpVtbl` against
+/// `&d3d12_fence_vtbl` in `CommandQueue::Signal` / `Wait` and on its queue thread).
+#[repr(C)]
+struct FenceProxy {
+    vt: usize,
+    pc: *mut c_void,
+}
+
+fn fence_proxy_vtable() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        const SLOTS: usize = 32;
+        let mut v = vec![0usize; SLOTS];
+        for slot in 0..12 {
+            // mov rcx, [rcx + 8]; mov rax, [rcx]; jmp [rax + slot * 8]
+            let mut c = vec![0x48u8, 0x8B, 0x49, 0x08, 0x48, 0x8B, 0x01, 0xFF, 0xA0];
+            c.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
+            let p = crate::stubs::alloc_code(c.len());
+            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len()) };
+            v[slot] = p as usize;
+        }
+        v[0] = fence_proxy_qi as usize;
+        v[2] = fence_proxy_release as usize;
+        v[10] = fence_proxy_signal as usize;
+        v[12] = super::fence_x::completed_value_address as usize;
+        for slot in 13..SLOTS {
+            let (addr, _) = stubs::make_stub_info(DLL, &format!("ID3D12Fence1::#{slot} (not on PC)"), 0);
+            v[slot] = addr;
+        }
+        Box::leak(v.into_boxed_slice()).as_ptr() as usize
+    })
+}
+
+unsafe extern "system" fn fence_proxy_qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let pc = (*(this as *const FenceProxy)).pc;
+    let f: QiFn = std::mem::transmute(*vt(pc));
+    let hr = f(pc, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && *ppv == pc {
+        *ppv = this;
+    } else if hr == E_NOINTERFACE && !riid.is_null() {
+        let s = layout::guid_string(&*riid);
+        if UNKNOWN_IIDS.lock().unwrap().insert(s.clone()) {
+            crate::xlog_warn!("D3D12.X: QueryInterface({s}) – interface unknown on the PC (console-only?)");
+        }
+    }
+    hr
+}
+
+unsafe extern "system" fn fence_proxy_release(this: *mut c_void) -> u32 {
+    let pc = (*(this as *const FenceProxy)).pc;
+    let f: RefFn = std::mem::transmute(*vt(pc).add(2));
+    let n = f(pc);
+    if n == 0 {
+        drop(Box::from_raw(this as *mut FenceProxy));
+    }
+    n
+}
+
+unsafe extern "system" fn fence_proxy_signal(this: *mut c_void, value: u64) -> HRESULT {
+    let pc = (*(this as *const FenceProxy)).pc;
+    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(*vt(pc).add(10));
+    let hr = f(pc, value);
+    super::fence_x::note_cpu_signal(this as usize);
+    hr
+}
+
+unsafe fn wrap_fence_proxy(pc: *mut c_void) -> *mut c_void {
+    Box::into_raw(Box::new(FenceProxy { vt: fence_proxy_vtable(), pc })) as *mut c_void
+}
+
+unsafe fn unwrap_fence(p: *mut c_void) -> *mut c_void {
+    if crate::util::under_wine() { unwrap_fence_proxy(p) } else { p }
+}
+
+unsafe fn unwrap_fence_proxy(p: *mut c_void) -> *mut c_void {
+    if !p.is_null() && crate::gpu::shader::readable(p as usize, 16) && *(p as *const usize) == fence_proxy_vtable() {
+        (*(p as *const FenceProxy)).pc
+    } else {
+        p
+    }
+}
+
+/// Create an un-adopted, un-proxied `ID3D12Fence` for XCL's own internal queue tracking
+/// (`late_release`, `alloc_pool`, `list_x`, `cpu_writes`, `present`, `vram`, `drain_gpu`)
+/// so under Wine/vkd3d-proton it can be signalled on raw internal queues (`sparse::queue()`)
+/// and passed to native APIs without hitting `FenceProxy` vtable mismatches.
+pub(super) unsafe fn create_raw_fence(dev: &ID3D12Device) -> windows::core::Result<ID3D12Fence> {
+    let raw = dev.as_raw();
+    if is_ext(vt(raw) as usize) {
+        type F = unsafe extern "system" fn(*mut c_void, u64, D3D12_FENCE_FLAGS, *const GUID, *mut *mut c_void) -> HRESULT;
+        let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateFence")));
+        let mut out: *mut c_void = std::ptr::null_mut();
+        let hr = f(raw, 0, D3D12_FENCE_FLAG_NONE, (&ID3D12Fence::IID as *const windows::core::GUID).cast(), &mut out);
+        if hr < 0 {
+            return Err(windows::core::Error::from_hresult(windows::core::HRESULT(hr)));
+        }
+        return Ok(ID3D12Fence::from_raw(out));
+    }
+    dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+}
+
 /// fences created through the device (AddRef'd: they are released at the end only)
 /// (a read-write lock: `is_fence` reads it on every queue call, and `end_title` reads it with
 /// the title's threads suspended – a reader that holds it then blocks no other reader)
@@ -4060,7 +4245,21 @@ static FENCES: std::sync::RwLock<Vec<usize>> = std::sync::RwLock::new(Vec::new()
 
 /// CreateFence: as on the PC; the fence is remembered for `end_title`
 unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flags: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let hr = dev_create_fence_pc(this, value, flags, riid, ppv);
+    let hr = if crate::util::under_wine() {
+        type F = unsafe extern "system" fn(*mut c_void, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
+        let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateFence")));
+        let mut hr = f(this, value, flags, riid, ppv);
+        if hr == E_NOINTERFACE {
+            let iid = pc_iid(Kind::Fence);
+            hr = f(this, value, flags, &iid, ppv);
+        }
+        if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+            *ppv = wrap_fence_proxy(*ppv);
+        }
+        hr
+    } else {
+        dev_create_fence_pc(this, value, flags, riid, ppv)
+    };
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         let add: RefFn = std::mem::transmute(*vt(*ppv).add(1));
         add(*ppv);
@@ -8477,7 +8676,10 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
         c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
-    f(this, res, desc, handle);
+    {
+        let _res_guard = UnadoptGuard::new(res);
+        f(this, res, desc, handle);
+    }
     super::present::note_rtv(handle, res);
     if super::capture::enabled() {
         super::capture::note_view(handle, res as usize, false, (!desc.is_null()).then(|| (desc as *const [u32; 6]).read_unaligned()));
@@ -8570,7 +8772,10 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ClearState")));
     let bound = super::pso_async::resolve_for_bind(pso as usize);
-    f(this, bound as *mut c_void);
+    {
+        let _pso_guard = UnadoptGuard::new(bound as *mut c_void);
+        f(this, bound as *mut c_void);
+    }
     if !pso.is_null() {
         super::dred::mark_pipeline(this, pso as usize, bound);
     }
@@ -8643,7 +8848,10 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
 pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
-    let hr = f(raw);
+    let hr = {
+        let _alloc_guard = UnadoptGuard::new(raw);
+        f(raw)
+    };
     if hr >= 0 { dispatch_chain::allocator_reset(raw as usize); }
     hr
 }
@@ -8759,7 +8967,8 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                 super::sparse::send_pending();
             }
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
-            let hr = f(this, a1, a2);
+            let raw_fence = unwrap_fence(a1 as *mut c_void) as usize;
+            let hr = f(this, raw_fence, a2);
             if hr >= 0 {
                 if older == 14 {
                     super::fence_x::note_queue_signal(a1, a2 as u64);
@@ -8846,6 +9055,18 @@ macro_rules! queue_slots {
 }
 queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
 
+/// command queue #14 Signal (PC callers, e.g. XCL's own drain/present/sparse helpers)
+unsafe extern "system" fn q_signal_pc(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
+    f(this, unwrap_fence(fence), value)
+}
+
+/// command queue #15 Wait (PC callers)
+unsafe extern "system" fn q_wait_pc(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Wait")));
+    f(this, unwrap_fence(fence), value)
+}
+
 /// The calls of the queue's page-mapping method recorded so far and what they did, summed, and
 /// when their line was logged last.
 static PAGE_MAPPINGS: Mutex<(u64, crate::hle::kernelx::mirrors::Mapped, Option<std::time::Instant>)> =
@@ -8908,7 +9129,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
     super::sparse::send_pending();
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
-    let hr = f(this, fence, value);
+    let hr = f(this, unwrap_fence(fence), value);
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
@@ -9067,6 +9288,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         let t = std::time::Instant::now();
         {
             let _in_driver = super::watch::in_driver(super::watch::Call::Execute);
+            let _list_guards: Vec<_> = chunk.iter().filter_map(|&l| UnadoptGuard::new(l)).collect();
             f(this, chunk.len() as u32, chunk.as_ptr());
         }
         super::gpu_times::executed(this, chunk);
@@ -9104,7 +9326,7 @@ pub fn drain_gpu() {
             let qr = q as *mut c_void;
             let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qr) else { continue };
             let submit = || {
-                let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                let f: ID3D12Fence = create_raw_fence(dev)
                     .map_err(|e| fence::api_error(dev, "CreateFence", e))?;
                 q.Signal(&f, 1).map_err(|e| fence::api_error(dev, "Signal", e))?;
                 Ok(f)
@@ -10554,6 +10776,69 @@ mod map_tests {
         // Explicit DEPTH_STENCIL subobject is always preserved regardless of DSVFormat.
         assert!(parse(None, Some(true)).DepthStencilState.DepthEnable.as_bool());
         assert!(!parse(Some(40), Some(false)).DepthStencilState.DepthEnable.as_bool());
+    }
+}
+
+#[cfg(test)]
+mod wine_vtable_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    #[test]
+    fn unadopt_guard_restores_native_vtable_and_reapplies_extended_on_drop() {
+        let orig_vt = [0usize; 8];
+        let mut ext_buf = [0usize; 9];
+        ext_buf[0] = orig_vt.as_ptr() as usize;
+        let ext_vt = unsafe { ext_buf.as_ptr().add(1) as usize };
+        let mut fake_obj = ext_vt;
+        let obj = &mut fake_obj as *mut usize as *mut c_void;
+
+        unsafe {
+            assert_eq!(*(obj as *const usize), ext_vt);
+            {
+                let _guard = UnadoptGuard::enter(obj);
+                assert_eq!(*(obj as *const usize), orig_vt.as_ptr() as usize);
+            }
+            assert_eq!(*(obj as *const usize), ext_vt);
+        }
+    }
+
+    #[test]
+    fn fence_proxy_forwards_signal_unwraps_and_frees_on_final_release() {
+        #[repr(C)]
+        struct FakeFence {
+            vt: *const usize,
+            refs: AtomicU32,
+            signaled: AtomicU64,
+        }
+        unsafe extern "system" fn fake_release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeFence)).refs.fetch_sub(1, Ordering::Relaxed) - 1
+        }
+        unsafe extern "system" fn fake_signal(this: *mut c_void, value: u64) -> HRESULT {
+            (*(this as *const FakeFence)).signaled.store(value, Ordering::Relaxed);
+            0
+        }
+
+        let mut vt = [0usize; 16];
+        vt[2] = fake_release as usize;
+        vt[10] = fake_signal as usize;
+        let fake = Box::new(FakeFence { vt: vt.as_ptr(), refs: AtomicU32::new(1), signaled: AtomicU64::new(0) });
+        let raw = &*fake as *const FakeFence as *mut c_void;
+
+        unsafe {
+            let proxy = wrap_fence_proxy(raw);
+            assert_ne!(proxy, raw);
+            assert_eq!(unwrap_fence_proxy(proxy), raw);
+            assert_eq!(unwrap_fence_proxy(raw), raw);
+            assert_eq!(*(raw as *const usize), vt.as_ptr() as usize, "native fence vtable must remain unmodified");
+
+            let signal_fn: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(*(*(proxy as *const *const usize)).add(10));
+            assert_eq!(signal_fn(proxy, 42), 0);
+            assert_eq!(fake.signaled.load(Ordering::Relaxed), 42);
+
+            let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(proxy as *const *const usize)).add(2));
+            assert_eq!(release_fn(proxy), 0);
+        }
     }
 }
 

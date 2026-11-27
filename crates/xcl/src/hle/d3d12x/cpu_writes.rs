@@ -226,7 +226,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
                     return;
                 }
                 let Some(dev) = dev else { return };
-                let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+                let Ok(fence) = super::real::create_raw_fence(&dev) else { return };
                 v.insert(QueueFence { fence, value: 0 })
             }
         };
