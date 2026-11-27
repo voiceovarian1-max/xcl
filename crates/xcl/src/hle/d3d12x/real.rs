@@ -2248,11 +2248,83 @@ pub fn pso_layout(pso: usize) -> Option<String> {
 }
 
 /// `XCL_SKIP_CS=<hash>,<hash>` (diagnostic, with `XCL_GPU_PROFILE=1`, whose report names the
-/// hashes): dispatches of these console compute programs are left out.
-pub fn skip_named_cs(pso: usize) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    let list = LIST.get_or_init(|| std::env::var("XCL_SKIP_CS").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default());
-    !list.is_empty() && pso_shaders(pso).is_some_and(|(h, _)| list.contains(&h))
+/// hashes): dispatches of these console compute programs are left out. `XCL_SKIP_CS=all`: every one;
+/// `=indirect`: those of an ExecuteIndirect; `=direct`: the plain Dispatch calls.
+pub fn skip_named_cs(pso: usize, indirect: bool) -> bool {
+    if left_out_cs(pso) {
+        return true;
+    }
+    static LIST: std::sync::OnceLock<(u8, Vec<u64>)> = std::sync::OnceLock::new();
+    let (mode, list) = LIST.get_or_init(|| {
+        let v = std::env::var("XCL_SKIP_CS").unwrap_or_default();
+        let mode = match v.trim() {
+            "all" => 3,
+            "indirect" => 2,
+            "direct" => 1,
+            _ => 0,
+        };
+        (mode, v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect())
+    });
+    *mode & (if indirect { 2 } else { 1 }) != 0 || (!list.is_empty() && pso_shaders(pso).is_some_and(|(h, _)| list.contains(&h)))
+}
+
+/// (local) Console compute programs whose dispatches are left out by name: `XCL_RT_OFF=1` the
+/// title's ray-traced lighting (`CS_ScreenProbes_ActivateRays`, `CS_RaytracingResolve`: with no
+/// acceleration structures they shade no hits, and the first is a retail title's most costly
+/// program), `XCL_SKIP_CS_NAMES=<name>,<name>` any others. A name is looked for in the console
+/// shader's container, as cool_fox by codec_d does (VIctory family, https://github.com/DoubleGhosty/cool_fox,
+/// commit f4b48ad, crates/victory-gpu/src/pipeline/make.rs `left_out`; GPL-3.0-or-later).
+/// Changes the picture: the indirect light those passes give is missing.
+fn left_out_names() -> &'static [Vec<u8>] {
+    static NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut v: Vec<Vec<u8>> = std::env::var("XCL_SKIP_CS_NAMES").unwrap_or_default().split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| n.as_bytes().to_vec()).collect();
+        if std::env::var("XCL_RT_OFF").is_ok_and(|v| v.trim() == "1") {
+            v.extend([b"CS_ScreenProbes_ActivateRays".to_vec(), b"CS_RaytracingResolve".to_vec()]);
+        }
+        v
+    })
+}
+
+/// The name of `left_out_names` the console compute shader `cs` holds, if any.
+fn left_out_name(cs: &[u8], names: &[Vec<u8>]) -> Option<usize> {
+    names.iter().position(|n| !n.is_empty() && cs.windows(n.len()).any(|w| w == n.as_slice()))
+}
+
+/// Whether a run leaves the console shader `blob` out by name (`left_out_names`; for the
+/// offline precompile, which then does not build it).
+pub fn left_out_by_name(blob: &[u8]) -> bool {
+    let names = left_out_names();
+    !names.is_empty() && left_out_name(blob, names).is_some()
+}
+
+/// Record hashes of console compute programs left out by name (`left_out_names`).
+static LEFT_OUT: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+/// At pipeline creation: whether the console compute shader `cs` (record `record`) is left out by
+/// name (then it is not translated: `translated_compute_pso_once`); noted for `skip_named_cs` too.
+fn note_left_out(cs: &[u8], record: u64) -> bool {
+    let names = left_out_names();
+    if names.is_empty() {
+        return false;
+    }
+    let Some(k) = left_out_name(cs, names) else { return false };
+    let fresh = LEFT_OUT.lock().unwrap().get_or_insert_with(HashSet::new).insert(record);
+    if fresh {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: CS {record:016x} ({}) left out by name: its dispatches are skipped ({n} programs so far)", String::from_utf8_lossy(&names[k]));
+        }
+    }
+    true
+}
+
+/// Whether the pipeline `pso` runs a console compute program left out by name.
+fn left_out_cs(pso: usize) -> bool {
+    let g = LEFT_OUT.lock().unwrap();
+    let Some(set) = g.as_ref().filter(|s| !s.is_empty()) else { return false };
+    pso_shaders(super::pso_async::resolve(pso)).is_some_and(|(h, _)| set.contains(&h) || set.contains(&(h ^ ab::MARK)))
 }
 
 pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
@@ -2790,8 +2862,149 @@ fn empty_bvh() -> Option<u64> {
     })
 }
 
+/// (local experiment, `XCL_NO_TEXTURES=1`) textures given no video memory (`device_x`): their
+/// views show a shared grey placeholder, so shaders read plausible values rather than zeros
+static NO_TEX: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+pub(super) fn note_no_texture(res: usize) {
+    NO_TEX.lock().unwrap().get_or_insert_with(HashSet::new).insert(res);
+}
+fn is_no_texture(res: usize) -> bool {
+    res != 0 && NO_TEX.lock().unwrap().as_ref().is_some_and(|s| s.contains(&res))
+}
+
+/// device → (1x1 RGBA8 2D array of 6 slices, 1x1x1 RGBA8 3D), cleared to grey once
+static PLACEHOLDER: Mutex<Option<(usize, ID3D12Resource, ID3D12Resource)>> = Mutex::new(None);
+
+unsafe fn placeholders(dev: &ID3D12Device) -> Option<(ID3D12Resource, ID3D12Resource)> {
+    let key = dev.as_raw() as usize;
+    let mut g = PLACEHOLDER.lock().unwrap();
+    if let Some((k, a, b)) = g.as_ref() {
+        if *k == key {
+            return Some((a.clone(), b.clone()));
+        }
+    }
+    // `XCL_NO_TEXTURES_LEVEL=0..255`: the placeholder's level (default 128, grey)
+    let level = std::env::var("XCL_NO_TEXTURES_LEVEL").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(128) as f32 / 255.0;
+    let grey = [level, level, level, 1.0];
+    let clear = D3D12_CLEAR_VALUE { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM, Anonymous: D3D12_CLEAR_VALUE_0 { Color: grey } };
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let make = |dim: D3D12_RESOURCE_DIMENSION, depth: u16| -> Option<ID3D12Resource> {
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: dim,
+            Width: 1,
+            Height: 1,
+            DepthOrArraySize: depth,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut r: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_RENDER_TARGET, Some(&clear), &mut r).ok()?;
+        r
+    };
+    let (a, b) = (make(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6)?, make(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 1)?);
+    let rtvs: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 2, ..Default::default() }).ok()?;
+    let step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+    let h0 = rtvs.GetCPUDescriptorHandleForHeapStart();
+    let h1 = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h0.ptr + step };
+    let mut va = D3D12_RENDER_TARGET_VIEW_DESC { Format: clear.Format, ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DARRAY, ..Default::default() };
+    va.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_RTV { MipSlice: 0, FirstArraySlice: 0, ArraySize: 6, PlaneSlice: 0 };
+    let mut vb = D3D12_RENDER_TARGET_VIEW_DESC { Format: clear.Format, ViewDimension: D3D12_RTV_DIMENSION_TEXTURE3D, ..Default::default() };
+    vb.Anonymous.Texture3D = D3D12_TEX3D_RTV { MipSlice: 0, FirstWSlice: 0, WSize: 1 };
+    dev.CreateRenderTargetView(&a, Some(&va), h0);
+    dev.CreateRenderTargetView(&b, Some(&vb), h1);
+    let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).ok()?;
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+    list.ClearRenderTargetView(h0, &grey, None);
+    list.ClearRenderTargetView(h1, &grey, None);
+    let to_read = |r: &ID3D12Resource| D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: std::mem::transmute_copy(r),
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                StateAfter: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            }),
+        },
+        ..Default::default()
+    };
+    list.ResourceBarrier(&[to_read(&a), to_read(&b)]);
+    list.Close().ok()?;
+    queue.ExecuteCommandLists(&[Some(list.cast().ok()?)]);
+    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+    queue.Signal(&fence, 1).ok()?;
+    // (no event: returns once the fence has the value)
+    fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).ok()?;
+    crate::xlog_info!("D3D12.X: XCL_NO_TEXTURES: views of CPU-filled textures show a grey 1x1 placeholder");
+    *g = Some((key, a.clone(), b.clone()));
+    Some((a, b))
+}
+
+/// (local experiment, `XCL_NO_TEXTURES=2`) the 2D placeholder, a reference for the caller; its views
+/// show the placeholder (`is_no_texture`)
+pub(super) unsafe fn shared_placeholder(dev: &ID3D12Device) -> Option<ID3D12Resource> {
+    let (a, _) = placeholders(dev)?;
+    note_no_texture(a.as_raw() as usize);
+    Some(a)
+}
+
+/// The view `v` (None: the whole resource) of a memory-less texture as a view of a placeholder.
+unsafe fn placeholder_view(dev: &ID3D12Device, res: *mut c_void, v: Option<D3D12_SHADER_RESOURCE_VIEW_DESC>) -> Option<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    let r = ID3D12Resource::from_raw_borrowed(&res)?;
+    let rd = r.GetDesc();
+    let mut out = v.unwrap_or_else(|| D3D12_SHADER_RESOURCE_VIEW_DESC {
+        ViewDimension: match rd.Dimension {
+            D3D12_RESOURCE_DIMENSION_TEXTURE3D => D3D12_SRV_DIMENSION_TEXTURE3D,
+            _ if rd.DepthOrArraySize > 1 => D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            _ => D3D12_SRV_DIMENSION_TEXTURE2D,
+        },
+        Shader4ComponentMapping: 0x1688,
+        ..Default::default()
+    });
+    let (a, b) = placeholders(dev)?;
+    out.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    let target = match out.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            out.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 };
+            a
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            out.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: 0, MipLevels: 1, FirstArraySlice: 0, ArraySize: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 };
+            a
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            out.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: 0, MipLevels: 1, ResourceMinLODClamp: 0.0 };
+            a
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            out.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MostDetailedMip: 0, MipLevels: 1, First2DArrayFace: 0, NumCubes: 1, ResourceMinLODClamp: 0.0 };
+            a
+        }
+        D3D12_SRV_DIMENSION_TEXTURE3D => {
+            out.Anonymous.Texture3D = D3D12_TEX3D_SRV { MostDetailedMip: 0, MipLevels: 1, ResourceMinLODClamp: 0.0 };
+            b
+        }
+        _ => return None,
+    };
+    Some((target, out))
+}
+
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
+    let mut placeholder: Option<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)> = None;
+    if is_no_texture(res as usize) {
+        if let Some(dev) = ID3D12Device::from_raw_borrowed(&this) {
+            placeholder = placeholder_view(dev, res, desc.as_ref().copied());
+        }
+    }
+    let (res, desc) = match &placeholder {
+        Some((r, v)) => (r.as_raw(), v as *const D3D12_SHADER_RESOURCE_VIEW_DESC),
+        None => (res, desc),
+    };
     let mut copy = desc.as_ref().copied();
     if let Some(c) = copy.as_mut() {
         c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(c.Format.0 as u32) as i32);
@@ -2988,6 +3201,21 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         return r as *mut c_void;
     }
     note_view_miss(va, &x);
+    // (local experiment, `XCL_NO_TEXTURES=1`) the title never sees this object: no texture is made
+    // for it, the placeholder stands in (a texture object costs 1-7 ms in the driver)
+    {
+        static NO_TEXTURES: OnceLock<bool> = OnceLock::new();
+        let d = super::device_x::pc_resource_desc(&x);
+        let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+        let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+        if !buffer && !super::vram::gpu_owned(flags) && *NO_TEXTURES.get_or_init(|| std::env::var("XCL_NO_TEXTURES").is_ok_and(|v| v.trim() == "1")) {
+            if let Some(shared) = ID3D12Device::from_raw_borrowed(&this).and_then(|dev| shared_placeholder(dev)) {
+                let r = shared.into_raw();
+                MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
+                return r;
+            }
+        }
+    }
     let mut r = std::ptr::null_mut();
     // (in COMMON, not the state the title made the memory's buffer in: `depth_uav` keeps that)
     let hr = super::depth_uav::by_address(|| super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r));
@@ -5428,6 +5656,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if !is_console(cs) {
         return None;
     }
+    // (local) left out by name (`XCL_RT_OFF`, `XCL_SKIP_CS_NAMES`): neither translated nor built;
+    // the title gets the stand-in pipeline and its dispatches are skipped as untranslated
+    if note_left_out(cs, crate::gpu::shader::fnv64(cs)) {
+        return Some(Err(()));
+    }
     // made when first bound (`pso_async::lazy`): not even translated now
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
@@ -5933,6 +6166,27 @@ fn forget_compute_blob(key: (u64, usize, i32)) {
         if let Some(b) = m.remove(&key) {
             *total -= b.len();
         }
+    }
+}
+
+#[cfg(test)]
+mod left_out_tests {
+    use super::left_out_name;
+
+    /// A name is found anywhere in the container's bytes; none of the names: not left out.
+    #[test]
+    fn a_compute_shader_is_left_out_by_a_name_in_its_container() {
+        let names = vec![b"CS_ScreenProbes_ActivateRays".to_vec(), b"CS_RaytracingResolve".to_vec()];
+        let mut blob = vec![0u8; 64];
+        blob.extend_from_slice(b"indirect_diffuse_lighting:CS_ScreenProbes_ActivateRays\0");
+        blob.extend_from_slice(&[0xFF; 16]);
+        assert_eq!(left_out_name(&blob, &names), Some(0));
+        let resolve = [b"xx".as_slice(), b"CS_RaytracingResolve_Specular", b"yy"].concat();
+        assert_eq!(left_out_name(&resolve, &names), Some(1));
+        assert_eq!(left_out_name(b"CS_ScreenProbes_ActivateProbes and CS_Raytracing", &names), None, "a neighbour's name");
+        assert_eq!(left_out_name(b"", &names), None);
+        assert_eq!(left_out_name(&blob, &[]), None);
+        assert_eq!(left_out_name(&blob, &[Vec::new()]), None, "an empty name matches nothing");
     }
 }
 

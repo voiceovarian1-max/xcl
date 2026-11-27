@@ -2855,7 +2855,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    if !gfx && super::real::skip_named_cs(pso) {
+    if !gfx && super::real::skip_named_cs(pso, true) {
         return;
     }
     // an indirect draw gets its frame trace line as a direct one (`graphics_bound`), marked
@@ -3813,7 +3813,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
-    if super::real::skip_named_cs(pso) {
+    if super::real::skip_named_cs(pso, false) {
         return Ok(());
     }
     // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`). The loop budget is

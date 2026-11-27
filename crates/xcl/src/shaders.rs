@@ -2170,6 +2170,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                // (local) programs a run leaves out by name (`XCL_RT_OFF`, `XCL_SKIP_CS_NAMES`) are not built
+                if crate::hle::d3d12x::real::left_out_by_name(&blob) {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {

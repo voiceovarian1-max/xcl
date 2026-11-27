@@ -1128,12 +1128,43 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`);
     // sampled textures: on the same shared 64 KiB pages when tiled resources allow, else committed
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    // (local experiment) `XCL_NO_TEXTURES=1`: a texture the CPU fills gets no video memory – a
+    // reserved texture with nothing mapped (reads give 0), never uploaded
+    // `XCL_NO_TEXTURES=2`: no texture object made either – every such texture is one shared object
+    // (the placeholder), a reference each (how much the making of texture objects costs the title)
+    static NO_TEXTURES: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let no_textures = *NO_TEXTURES.get_or_init(|| std::env::var("XCL_NO_TEXTURES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if !buffer && !super::vram::gpu_owned(flags) && no_textures == 2 {
+        if let Some(dev) = ID3D12Device::from_raw_borrowed(&this) {
+            if let Some(shared) = real::shared_placeholder(dev) {
+                *ppv = shared.into_raw();
+                return 0;
+            }
+        }
+    }
+    // `XCL_NO_TEXTURES=3`: as 1 for block-compressed textures only (BC1–BC7: the art); textures of
+    // other formats (numbers the title's shaders compute with, loop counts among them) stay real
+    let art = || matches!(std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC).Format.0, 70..=84 | 94..=99);
+    if !buffer && !super::vram::gpu_owned(flags) && (no_textures == 1 || (no_textures == 3 && art())) {
+        let mut tiled = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+        tiled.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+        let hr = real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
+        if hr >= 0 && !(*ppv).is_null() {
+            real::note_title_address(*ppv as usize, va as usize);
+            real::note_no_texture(*ppv as usize);
+            return hr;
+        }
+    }
     let mut placed_hr = None;
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
         if super::vram::gpu_owned(flags) {
-            if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
+            let placed = {
+                let _t = crate::hle::api_cost::time(crate::hle::api_cost::Call::TextureTargets);
+                super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv)
+            };
+            if let Some(hr) = placed {
                 if hr >= 0 && !(*ppv).is_null() {
                     if let Some(bytes) = console_bytes {
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
