@@ -63,6 +63,8 @@ struct State {
     /// the next dispatch's thread limits (`IO_THREAD_LIMIT`; a `DispatchX` with thread
     /// dimensions), taken by its `bind_abi`
     limits: [u32; 3],
+    /// the count check's buffer was left INDIRECT_ARGUMENT in this recording (`indirect_guard`)
+    guard_out_ia: bool,
 }
 
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
@@ -445,6 +447,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.heaps = [0; 2];
         // (the scratch blocks are in `res_retired` already)
         (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open) = (None, 0, 0, false, None);
+        s.guard_out_ia = false;
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -503,6 +506,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         // the two-pass record buffers and argument scratch of `to`'s previous recording, as in
         // `reset`: the GPU may still read them, so the new one takes fresh ones
         (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open) = (None, 0, 0, false, None);
+        s.guard_out_ia = false;
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -2371,7 +2375,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         trace_ui_draw(this, raw_pso, true);
     }
     // (binds a compute root signature and a pipeline: before the dispatch's or draw's own)
-    let checked = super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf);
+    let out_ia = with(this, |s| s.guard_out_ia);
+    let checked = super::indirect_guard::check_in(this, pso, sig, max, args, args_off, count_buf, out_ia);
+    if checked.is_some() {
+        // (the check wrote it: UNORDERED_ACCESS now)
+        with(this, |s| s.guard_out_ia = false);
+    }
     match bind_abi(this, list, pso, gfx, None, 0) {
         Ok(b) => {
             let whole = if compute {
@@ -2430,7 +2439,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 (Some(c), None) => {
                     super::gpu_profile::note_counts(&t, c.slot);
-                    c.run(this, |buffer, off| pc(this, sig, 1, buffer, off, 0, 0));
+                    c.run_keeping(this, |buffer, off| pc(this, sig, 1, buffer, off, 0, 0));
+                    with(this, |s| s.guard_out_ia = true);
                 }
                 (None, None) => fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off)),
             }

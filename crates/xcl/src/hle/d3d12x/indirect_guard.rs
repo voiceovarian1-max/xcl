@@ -308,6 +308,14 @@ pub(super) struct Checked {
 /// offset in it) on `list`; None: not one this checks, it runs as it is. Binds a compute root
 /// signature and a pipeline: the caller binds the dispatch's or draw's after it.
 pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize) -> Option<Checked> {
+    check_in(list, pso, sig, max, args, args_off, count_buf, false)
+}
+
+/// `check` on a list where the check's buffer was left INDIRECT_ARGUMENT (`out_ia`,
+/// `Checked::run_keeping`): it goes back to UNORDERED_ACCESS in the same ResourceBarrier call as
+/// the check's UAV barrier (vkd3d-proton makes one pipeline barrier of a call's barriers).
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn check_in(list: *mut c_void, pso: usize, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, out_ia: bool) -> Option<Checked> {
     if max != 1 || count_buf != 0 {
         return None;
     }
@@ -347,7 +355,27 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }) },
     };
-    l.ResourceBarrier(&[written]);
+    let timed = super::gpu_profile::begin_own(list, super::gpu_profile::OWN_COUNT_CHECK, 1);
+    if out_ia {
+        let back = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: ManuallyDrop::new(Some(g.out.clone())),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                }),
+            },
+        };
+        // (a bitwise copy into the call: the one reference is released once below)
+        l.ResourceBarrier(&[written.clone(), std::ptr::read(&back)]);
+        let mut back = back;
+        ManuallyDrop::drop(&mut (*back.Anonymous.Transition).pResource);
+    } else {
+        l.ResourceBarrier(&[written.clone()]);
+    }
     l.SetComputeRootSignature(&g.rs);
     // (past the hook of a title's call: what the title bound stays the list's pipeline)
     super::list_x::set_compute_pipeline(list, g.pso.as_raw());
@@ -360,6 +388,13 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     l.SetComputeRootUnorderedAccessView(3, g.seen_va);
     l.SetComputeRootUnorderedAccessView(4, shown);
     l.Dispatch(1, 1, 1);
+    // (local experiment) `XCL_INDIRECT_GUARD_REPEAT=N`: the barrier and the check N times, to
+    // measure what they cost (the same counts are written again)
+    for _ in 1..repeat() {
+        l.ResourceBarrier(&[written.clone()]);
+        l.Dispatch(1, 1, 1);
+    }
+    super::gpu_profile::end(list, timed);
     report(&g);
     Some(Checked { guard: g, slot })
 }
@@ -385,6 +420,14 @@ impl Checked {
     /// read left it in UNORDERED_ACCESS).
     pub(super) unsafe fn read(&self, list: *mut c_void) {
         super::list_x::transition(list, self.guard.out.as_raw() as usize, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    }
+
+    /// `run`, leaving the buffer INDIRECT_ARGUMENT: the list's next check takes it back
+    /// (`check_in` with `out_ia`); a buffer goes back to COMMON when its submission is done.
+    pub(super) unsafe fn run_keeping(&self, list: *mut c_void, op: impl FnOnce(usize, u64)) {
+        let out = self.guard.out.as_raw() as usize;
+        super::list_x::transition(list, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        op(out, self.slot as u64 * SLOT as u64);
     }
 }
 
@@ -621,6 +664,67 @@ void main() { c.InterlockedAdd(0, 1u); }
             assert!(check(raw, 0, s, 1, a, 0, a).is_none());
             note_signature(s, &[D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT.0, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0]);
             assert!(check(raw, 0, s, 1, a, 0, 0).is_none());
+        }
+    }
+
+    /// Three checked ExecuteIndirects on one list (in range, garbage, in range), the check's
+    /// buffer left INDIRECT_ARGUMENT between them (`run_keeping`, `check_in` with `out_ia`): each
+    /// runs its own checked counts.
+    #[test]
+    fn checked_execute_indirects_in_one_list_keep_the_buffer_between_them() {
+        let src = r#"
+RWByteAddressBuffer c : register(u0);
+[numthreads(1, 1, 1)]
+void main() { c.InterlockedAdd(0, 1u); }
+"#;
+        unsafe {
+            let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(dev) = device() else { return };
+            let cs = real::compile(src, "cs_5_0");
+            assert!(!cs.is_empty());
+            let param = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: 1, pParameters: &param, ..Default::default() };
+            let mut blob: Option<ID3DBlob> = None;
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).unwrap();
+            let blob = blob.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).unwrap();
+            let code = D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as _, BytecodeLength: cs.len() };
+            let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: transmute_copy(&rs), CS: code, ..Default::default() }).unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let sig = signature(&dev, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, 12);
+            let ((args, args_at), (groups, groups_at)) = (cpu_buffer(&dev, 256), cpu_buffer(&dev, 256));
+            let (s, a) = (sig.as_raw() as usize, args.as_raw() as usize);
+            // in range (7), garbage (the bits of 1.0f: none), in range (3 x 4 x 5)
+            let cases: [[u32; 3]; 3] = [[7, 1, 1], [0x3F80_0000, 1, 1], [3, 4, 5]];
+            for (k, want) in cases.iter().enumerate() {
+                for (i, w) in want.iter().enumerate() {
+                    *args_at.add(4 * k + i) = *w;
+                }
+            }
+            *groups_at = 0;
+            if let Some(g) = GUARD.lock().unwrap().as_ref() {
+                g.next.store(0, Ordering::Relaxed);
+            }
+            let (_alloc, list) = title_list(&dev, ty);
+            let raw = list.as_raw();
+            type Ei = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
+            let ei: Ei = std::mem::transmute(real::orig_fn(raw, 59));
+            let mut out_ia = false;
+            for k in 0..cases.len() {
+                let checked = check_in(raw, 0, s, 1, a, 16 * k as u64, 0, out_ia).expect("checked");
+                list.SetComputeRootSignature(&rs);
+                list.SetPipelineState(&pso);
+                list.SetComputeRootUnorderedAccessView(0, groups.GetGPUVirtualAddress());
+                checked.run_keeping(raw, |b, o| ei(raw, s, 1, b, o, 0, 0));
+                out_ia = true;
+            }
+            run(&dev, &queue, &list);
+            assert_eq!(std::ptr::read_volatile(groups_at), 7 + 60, "groups run: the in-range ones only");
         }
     }
 
