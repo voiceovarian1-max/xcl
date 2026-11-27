@@ -302,4 +302,175 @@ mod tests {
         assert!(transcript.contains("coherent window could not be restored"), "{transcript}");
         assert!(!transcript.contains("continued after failed restore"), "{transcript}");
     }
+
+    /// (probe) ns per loop iteration of GPU atomics and loads on one buffer in each memory home:
+    /// video memory, the title's own pages opened with `OpenExistingHeapFromAddress` (as XCL opens
+    /// the coherent window), the same with write watch, and a driver CUSTOM write-back L0 heap (as
+    /// `remake` makes it). The table of PR #2844, for the adapter this runs on. Asserts nothing.
+    #[test]
+    fn gpu_memory_home_probe() {
+        use super::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        const HLSL: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0)"
+cbuffer C : register(b0) { uint boxes; uint iters; uint mode; uint stride; };
+RWByteAddressBuffer mem : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint acc = 0;
+    [loop] for (uint i = 0; i < iters; i++) {
+        uint box = (id.x * 7u + i * 131u) % boxes;
+        if (mode == 0) {
+            uint was;
+            mem.InterlockedAdd(box * stride, 1u, was);
+            acc += was;
+        } else {
+            acc += mem.Load(box * stride);
+        }
+    }
+    if (acc == 0x9e3779b9u) mem.Store(4, acc);
+}
+"#;
+        const STRIDE: u32 = 256;
+        const SIZE: usize = 65536 * STRIDE as usize;
+        if std::env::var_os("XCL_MEMORY_HOME_PROBE").is_none() {
+            return crate::gpu::recomp::runner::skip_test("probe: set XCL_MEMORY_HOME_PROBE=1");
+        }
+        let dev = match crate::gpu::recomp::runner::device() {
+            Ok(d) => d,
+            Err(e) => return crate::gpu::recomp::runner::skip_test(&e),
+        };
+        let dxil = match crate::gpu::recomp::dxc::compile_cached(HLSL, "main", "cs_6_6") {
+            Ok(d) => d.0,
+            Err(e) => return crate::gpu::recomp::runner::skip_test(&e),
+        };
+        unsafe {
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&cdesc).unwrap();
+            std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
+            let buf_desc = |flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: SIZE as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let placed = |heap: &ID3D12Heap, flags| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreatePlacedResource(heap, 0, &buf_desc(flags), D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let imported = |extra: u32| -> Option<ID3D12Resource> {
+                let p = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | extra, PAGE_READWRITE);
+                assert!(!p.is_null());
+                let dev3: ID3D12Device3 = dev.cast().ok()?;
+                match dev3.OpenExistingHeapFromAddress::<ID3D12Heap>(p) {
+                    Ok(h) => Some(placed(&h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)),
+                    Err(e) => {
+                        eprintln!("OpenExistingHeapFromAddress: {e}");
+                        None
+                    }
+                }
+            };
+            let mut homes: Vec<(&str, ID3D12Resource)> = Vec::new();
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &buf_desc(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut r,
+            )
+            .unwrap();
+            homes.push(("video memory", r.unwrap()));
+            if let Some(b) = imported(0) {
+                homes.push(("imported", b));
+            }
+            if let Some(b) = imported(MEM_WRITE_WATCH) {
+                homes.push(("imported, write watch", b));
+            }
+            for (name, flags) in [("CUSTOM L0 write-back", D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS), ("CUSTOM L0 write-back, write watch", D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH)] {
+                let desc = D3D12_HEAP_DESC {
+                    SizeInBytes: SIZE as u64,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_CUSTOM,
+                        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                        ..Default::default()
+                    },
+                    Alignment: 0x1_0000,
+                    Flags: flags,
+                };
+                let mut heap: Option<ID3D12Heap> = None;
+                match dev.CreateHeap(&desc, &mut heap) {
+                    Ok(()) => homes.push((name, placed(&heap.unwrap(), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))),
+                    Err(e) => eprintln!("CreateHeap {name}: {e}"),
+                }
+            }
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let freq = queue.GetTimestampFrequency().unwrap() as f64;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut qh: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut qh).unwrap();
+            let qh = qh.unwrap();
+            let mut rb: Option<ID3D12Resource> = None;
+            let mut rb_desc = buf_desc(D3D12_RESOURCE_FLAG_NONE);
+            rb_desc.Width = 16;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rb_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+            let rb = rb.unwrap();
+            let mut value = 0u64;
+            // (groups, iterations): 65,536 threads, as in the PR's 1024x64 groups
+            let (groups, iters) = (1024u32, 64u32);
+            eprintln!("memory home probe, {}: ns per loop iteration (atomics / loads), {groups}x64 threads, {iters} iterations, {STRIDE} B apart", crate::gpu::recomp::runner::adapter().unwrap_or_default());
+            for (name, buf) in &homes {
+                let mut row = format!("{name:>34}:");
+                for boxes in [1u32, 256, 4096, 65536] {
+                    let mut cell = Vec::new();
+                    for mode in [0u32, 1] {
+                        let mut best = f64::MAX;
+                        for _ in 0..3 {
+                            alloc.Reset().unwrap();
+                            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                            list.SetComputeRootSignature(&rs);
+                            list.SetPipelineState(&pso);
+                            list.SetComputeRoot32BitConstants(0, 4, [boxes, iters, mode, STRIDE].as_ptr().cast(), 0);
+                            list.SetComputeRootUnorderedAccessView(1, buf.GetGPUVirtualAddress());
+                            list.EndQuery(&qh, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                            list.Dispatch(groups, 1, 1);
+                            list.EndQuery(&qh, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                            list.ResolveQueryData(&qh, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &rb, 0);
+                            list.Close().unwrap();
+                            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                            value += 1;
+                            queue.Signal(&fence, value).unwrap();
+                            while fence.GetCompletedValue() < value {
+                                std::thread::yield_now();
+                            }
+                            let mut p: *mut c_void = std::ptr::null_mut();
+                            rb.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut p)).unwrap();
+                            let t = std::slice::from_raw_parts(p as *const u64, 2);
+                            let ns = (t[1].wrapping_sub(t[0])) as f64 / freq * 1e9;
+                            rb.Unmap(0, None);
+                            best = best.min(ns / iters as f64);
+                        }
+                        cell.push(format!("{best:.1}"));
+                    }
+                    row += &format!("  {boxes:>5} boxes {:>8} / {:<8}", cell[0], cell[1]);
+                }
+                eprintln!("{row}");
+            }
+        }
+    }
 }
