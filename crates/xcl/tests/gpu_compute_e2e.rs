@@ -306,6 +306,84 @@ fn offline_split_compute_pipeline_is_reused_by_a_second_process() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A title's compute pipeline description with a node mask takes the blob the offline pass
+/// wrote for the same program. vkd3d-proton refuses a cached blob whose description hash
+/// (`NodeMask`, `Flags`) differs from the pipeline's: a retail title passes mask 1, the offline
+/// pass 0, and every one of its blobs was refused, removed and compiled again.
+#[test]
+fn a_title_pipeline_with_a_node_mask_takes_the_offline_blob() {
+    use std::{fs, process::Command};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
+        runner::skip_test("no GPU");
+        return;
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no wave64");
+        return;
+    }
+    struct Cache(std::path::PathBuf, Option<std::ffi::OsString>);
+    impl Drop for Cache {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(prev) => std::env::set_var("XCL_DXIL_CACHE", prev),
+                None => std::env::remove_var("XCL_DXIL_CACHE"),
+            }
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = Cache(std::env::temp_dir().join(format!("xcl-node-mask-pso-{}-{nonce}", std::process::id())), std::env::var_os("XCL_DXIL_CACHE"));
+    let (input, cache) = (dir.0.join("input"), dir.0.join("cache"));
+    fs::create_dir_all(&input).unwrap();
+    // a program of its own: no other test's pipeline of it is in this process's memory
+    let code: Vec<u8> = [("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 0)][..], None), ("S_ENDPGM", "ENC_SOPP", &[][..], None)]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}")))
+        .collect();
+    let blob = console_cs(&code, 2 << 1 | 1 << 7, [4, 4, 1]);
+    fs::write(input.join("kernel.bin"), &blob).unwrap();
+    // the offline pass, translating as this process will (no unified memory: one window)
+    let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
+        .args(["--precompile", "--pipelines", "--windows", "1"]).env("XCL_DXIL_CACHE", &cache).env("XCL_PSO_DISK_CACHE", "1").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success() && text.contains("pipelines made on the GPU 1, refused 0"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+    let blobs = || -> Vec<std::path::PathBuf> { fs::read_dir(cache.join("driver")).map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "pso")).collect()).unwrap_or_default() };
+    let offline = blobs();
+    assert_eq!(offline.len(), 1, "the offline pass keeps one blob: {text}");
+    let kept = fs::read(&offline[0]).unwrap();
+
+    // the title: the same program through the backend hook, with a node mask
+    std::env::set_var("XCL_DXIL_CACHE", &cache);
+    let raw = real::device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
+    let game_rs: ID3D12RootSignature = unsafe {
+        let mut ser = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+        let ser = ser.unwrap();
+        dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+    };
+    let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(game_rs)),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr() as _, BytecodeLength: blob.len() },
+        NodeMask: 1,
+        ..Default::default()
+    };
+    let pso: Result<ID3D12PipelineState, _> = unsafe { dev.CreateComputePipelineState(&desc) };
+    unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
+    let pso = pso.expect("CreateComputePipelineState through the backend hook");
+    let real_raw = pso_async::resolve_wait(pso.as_raw() as usize);
+    assert!(real::is_translated_compute(real_raw), "the pipeline was not built from the translated shader");
+    // a refused blob is removed (`driver_cache::note`); a taken one stays as the offline pass wrote it
+    let after = blobs();
+    assert_eq!(after, offline, "the title asks for the offline pass's blob and keeps it");
+    assert_eq!(fs::read(&after[0]).unwrap(), kept, "the offline blob was replaced: the driver refused it");
+}
+
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
 /// s2/s3, thread ids in v0/v1: each thread writes its global (x, y), and through LDS +
 /// s_barrier the (x, y) of the thread at the mirrored index, which is in the other wave.

@@ -5792,8 +5792,9 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    // (upstream PR #1368) One adapter: node mask 0. vkd3d-proton hashes NodeMask and Flags into a cached blob's
-    // compatibility check, and `xcl shaders --pipelines` makes its blobs with 0.
+    // One adapter: node mask 0. vkd3d-proton hashes NodeMask and Flags into a cached blob's
+    // compatibility check, and `xcl shaders --pipelines` makes its blobs with 0: a title that
+    // passes another mask refused each of them and compiled the program again.
     copy.NodeMask = 0;
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
