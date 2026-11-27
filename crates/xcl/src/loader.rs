@@ -203,6 +203,13 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         }
     }
 
+    // 5b. (local) opt-in patches of one title build (`title_patch`: XCL_RENDER_SCALE, XCL_OUTPUT_SIZE,
+    // XCL_NO_WATCHDOG), while the image is still writable; step 6 flushes the instruction cache
+    if is_main {
+        let image = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, size) };
+        crate::title_patch::apply_asked(image, base as usize);
+    }
+
     // 6. page protections
     unsafe {
         let mut old = 0u32;

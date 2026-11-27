@@ -32,6 +32,7 @@ pub mod shaders;
 mod source_hash;
 pub mod state;
 pub mod stubs;
+pub mod title_patch;
 pub mod tls;
 pub mod util;
 pub mod vfs;
