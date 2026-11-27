@@ -47,7 +47,8 @@ struct State {
     scratch_used: u64,
     scratch_taken: u64,
     /// `scratch` was left in INDIRECT_ARGUMENT by the last two-pass ExecuteIndirect (only with
-    /// `two_pass_batch`; otherwise it goes back to COMMON after each)
+    /// `two_pass_batch`; otherwise it goes back to COMMON after each) – (local) or by a one-pass
+    /// ExecuteIndirect or an argument batch (`batched_args`), always
     scratch_in_args: bool,
     /// the record regions a mesh pass may still be reading, with no UAV barrier on the records
     /// since (`two_pass_plan`; only with `two_pass_batch`)
@@ -1896,6 +1897,129 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
     Ok(StageBind { rs, pso, views: [va(io_at), res_va, w(0), w(1), w(2), w(3)] })
 }
 
+/// (local, `XCL_MESH_TRACE=1`) The one-pass mesh trace: a buffer in system memory (a custom heap,
+/// mapped), `TRACE_SLICES` slices of `emit::MESH_TRACE_BYTES`, one for each draw in turn (root
+/// parameter 6): (buffer, its mapping, GPU address). The `io` block cannot hold it: the GPU writes
+/// the video-memory copy of unified memory, not the CPU's view (run 198: every record empty).
+static TRACE_BUF: std::sync::OnceLock<Option<(usize, usize, u64)>> = std::sync::OnceLock::new();
+/// (4,096: a recording of many traced draws reuses a slice only after this many; no fence check)
+const TRACE_SLICES: usize = 4096;
+/// the draws in the trace's slices: (slice, pipeline), the newest last
+static ONE_PASS_TRACES: Mutex<std::collections::VecDeque<(usize, usize)>> = Mutex::new(std::collections::VecDeque::new());
+
+unsafe fn trace_buffer(dev: &ID3D12Device) -> Option<(usize, usize, u64)> {
+    *TRACE_BUF.get_or_init(|| {
+        let bytes = (TRACE_SLICES * crate::gpu::recomp::emit::MESH_TRACE_BYTES) as u64;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() };
+        let mut res: Option<ID3D12Resource> = None;
+        if let Err(e) = dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res) {
+            crate::xlog_error!("one-pass trace: no system-memory buffer ({e})");
+            return None;
+        }
+        let res = res?;
+        let mut p = std::ptr::null_mut();
+        res.Map(0, None, Some(&mut p)).ok()?;
+        std::ptr::write_bytes(p as *mut u8, 0, bytes as usize);
+        let va = res.GetGPUVirtualAddress();
+        crate::xlog_info!("one-pass trace: {} KB of system memory at GPU {va:#x}", bytes >> 10);
+        Some((res.into_raw() as usize, p as usize, va))
+    })
+}
+
+/// The next draw's slice, zeroed and noted with its pipeline: its GPU address.
+unsafe fn next_trace_slice(dev: &ID3D12Device, pso: usize) -> Option<u64> {
+    let (_, map, va) = trace_buffer(dev)?;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let slice = (NEXT.fetch_add(1, Ordering::Relaxed) as usize) % TRACE_SLICES;
+    let bytes = crate::gpu::recomp::emit::MESH_TRACE_BYTES;
+    std::ptr::write_bytes((map + slice * bytes) as *mut u8, 0, bytes);
+    let mut t = ONE_PASS_TRACES.lock().unwrap();
+    if t.len() >= TRACE_SLICES {
+        t.pop_front();
+    }
+    t.push_back((slice, pso));
+    Some(va + (slice * bytes) as u64)
+}
+
+/// (trace) At a device loss: the records of the waves of the last one-pass draws that did not
+/// finish (record word 0 not `EDEDEDED`), into the log.
+pub fn dump_one_pass_traces() {
+    use crate::gpu::recomp::emit::{MESH_TRACE_BYTES, MESH_TRACE_WORDS};
+    let Some(Some((_, map, _))) = TRACE_BUF.get().copied() else {
+        crate::xlog_error!("one-pass trace: no buffer");
+        return;
+    };
+    let t = ONE_PASS_TRACES.lock().unwrap().clone();
+    let (mut shown, mut done, mut empty) = (0usize, 0usize, 0usize);
+    for (k, &(slice, pso)) in t.iter().enumerate().rev() {
+        for slot in 0..MESH_TRACE_BYTES / (4 * MESH_TRACE_WORDS) {
+            let at = (map + slice * MESH_TRACE_BYTES + slot * 4 * MESH_TRACE_WORDS) as *const u32;
+            let w: Vec<u32> = (0..MESH_TRACE_WORDS).map(|i| unsafe { std::ptr::read_volatile(at.add(i)) }).collect();
+            if w.iter().all(|&x| x == 0) {
+                empty += 1;
+            } else if w[0] == 0xEDED_EDED {
+                done += 1;
+            } else if shown < 64 {
+                shown += 1;
+                crate::xlog_error!("one-pass trace: draw -{} (pso {pso:#x}, MS {:016x}) slot {slot}: {:08x?}", t.len() - k, super::real::one_pass_ms_hash(pso), w);
+            }
+        }
+    }
+    crate::xlog_error!("one-pass trace: {} draws, {shown} unfinished wave records shown, {done} finished, {empty} empty", t.len());
+}
+
+/// (local) A one-pass mesh pipeline (`TwoPassPso::one_pass`) bound for a draw: its root
+/// signature, the pixel shader's `io` (u0, the graphics user data) and the mesh shader's (u1, the
+/// MS user data, where the two passes' records were), the memory windows (u2..), the pipeline.
+unsafe fn bind_one_pass_stage(this: *mut c_void, list: &ID3D12GraphicsCommandList, real_mesh_pso: usize, tp: &super::real::TwoPassPso) -> Result<(), String> {
+    super::list_x::ensure_view_heap(this);
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    let first = first_window(super::real::uma_window_va(0), u.shadowed())?;
+    let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
+    want_root_views(layout.as_deref(), &args, super::view_want::Path::MeshStage);
+    let copy = |bytes: &[u8]| -> Result<usize, String> {
+        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        Ok(p as usize)
+    };
+    let trace = crate::gpu::recomp::emit::mesh_trace();
+    let io_of = |ms: bool| -> Result<usize, String> {
+        let inline = layout.as_ref().map_or(0, |l| if ms { l.inline_ms } else { l.inline_gfx } as usize).min(args.len());
+        let table_at = copy(&args[inline..])?;
+        let io = two_pass_io(layout.as_deref(), &args, table_at as u64, ms, u.base(), heaps);
+        copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())
+    };
+    let (io_ps, io_ms) = (io_of(false)?, io_of(true)?);
+    let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
+    let rs_raw = tp.mesh_rs as *mut c_void;
+    let rs = ID3D12RootSignature::from_raw_borrowed(&rs_raw).ok_or("one-pass root signature")?;
+    list.SetGraphicsRootSignature(rs);
+    let views = [va(io_ps), va(io_ms)].into_iter().chain((0..4).map(|k| super::real::uma_window_va(k).unwrap_or(first)));
+    for (k, v) in views.enumerate() {
+        list.SetGraphicsRootUnorderedAccessView(k as u32, v);
+    }
+    if trace {
+        let dev = super::real::list_device(this).ok_or("no device")?;
+        let slice = next_trace_slice(&dev, real_mesh_pso).ok_or("no trace buffer")?;
+        list.SetGraphicsRootUnorderedAccessView(6, slice);
+    }
+    let pso_raw = real_mesh_pso as *mut c_void;
+    let pc = ID3D12PipelineState::from_raw_borrowed(&pso_raw).ok_or("one-pass mesh pipeline")?;
+    list.SetPipelineState(pc);
+    Ok(())
+}
+
 /// The pass that rewrites a two-pass ExecuteIndirect's arguments, on XCL's ABI: u0 = `count`,
 /// `stride`, `offset` (of the DispatchMesh argument), `split`, `cap` (groups with a record), and
 /// where the commands are (u2) and go (u3), in bytes. Each command goes out twice, for the compute
@@ -2016,12 +2140,14 @@ fn scale_views(consts: u64, src: u64, dst: u64, count: Option<u64>) -> [(u32, u6
 unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32, batch: bool) -> Result<(ID3D12Resource, u64), String> {
     let (rewrite, dst, dst_off) = prepare_scaled_args(this, src, count, max, stride, mesh_offset, split, cap)?;
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
+    // ((local) a one-pass ExecuteIndirect or an argument batch leaves the block in
+    // INDIRECT_ARGUMENT also without `batch`)
+    let before = scratch_state(with(this, |s| s.scratch_in_args));
     if batch {
-        let before = scratch_state(with(this, |s| s.scratch_in_args));
         emit_uav_and_transition(list, None, &dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     } else {
         emit_uav_barrier(list, None);
-        emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        emit_transition(list, &dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     let (rs_raw, pso_raw) = (rewrite.rs as *mut c_void, rewrite.pso as *mut c_void);
     list.SetComputeRootSignature(ID3D12RootSignature::from_raw_borrowed(&rs_raw));
@@ -2031,9 +2157,8 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     }
     list.Dispatch(rewrite.groups, 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    if batch {
-        with(this, |s| s.scratch_in_args = true);
-    }
+    // (without `batch` the caller puts it back to COMMON)
+    with(this, |s| s.scratch_in_args = batch);
     Ok((dst, dst_off))
 }
 
@@ -2342,13 +2467,14 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     };
     // (XCL_TWO_PASS_BATCH=2: deferred, or the deferred ones recorded before this one)
     if let Some(tp) = &tp {
-        if two_pass_defer() && defer_dispatch_mesh(this, tp, pso, raw_pso, [x, y, z]) {
         // (local) `XCL_TWO_PASS=0`
         if two_pass_switch() == 0 {
             mesh_work(this, super::targets::SKIPPED);
             count(DRAWS_SKIPPED);
             return;
         }
+        // ((local) a one-pass pipeline has no compute pass to defer)
+        if two_pass_defer() && !tp.one_pass && defer_dispatch_mesh(this, tp, pso, raw_pso, [x, y, z]) {
             return;
         }
     }
@@ -2359,6 +2485,35 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             return;
         }
         let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+        if tp.one_pass {
+            // (local) one pass: the console program is the mesh shader; it reads its group from X
+            // alone, as the compute pass did (at most 65 535 groups, D3D12's limit a dimension)
+            let n = groups.min(65_535);
+            super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [x, y, z], false);
+            let t = super::gpu_profile::begin(this, raw_pso, super::gpu_profile::Kind::OnePass, [n, 0, 0]);
+            let r = bind_one_pass_stage(this, list, pso, &tp);
+            if r.is_ok() {
+                pc_dm(this, n, 1, 1);
+            }
+            super::gpu_profile::end(this, t);
+            super::gpu_times::after(this);
+            match r {
+                Ok(()) => {
+                    mesh_work(this, super::targets::RAN);
+                    super::watch::note(raw_pso, super::watch::MESH, [groups, 0, 0]);
+                    count(DRAWS);
+                }
+                Err(e) => {
+                    mesh_work(this, super::targets::SKIPPED);
+                    count(DRAWS_SKIPPED);
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                        crate::xlog_warn!("D3D12.X: one-pass DispatchMesh skipped: {e}");
+                    }
+                }
+            }
+            return;
+        }
         let record_bytes = tp.record.record_dwords() as u64 * 4;
         let need = (groups as u64).saturating_mul(record_bytes);
         super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [x, y, z], false);
@@ -2501,8 +2656,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             return;
         }
         // (XCL_TWO_PASS_BATCH=2: one command whose arguments and count are in unified memory
-        // deferred; anything else as without, after the deferred draws before it)
-        if two_pass_defer() && max == 1 && args != 0 {
+        // deferred; anything else as without, after the deferred draws before it; (local) a
+        // one-pass pipeline has no compute pass to defer)
+        if two_pass_defer() && !tp.one_pass && max == 1 && args != 0 {
             let src = commands_at.filter(|&(_, n)| msig.byte_stride as usize <= n).map(|(p, _)| p);
             let count = match (count_buf, count_at) {
                 (0, _) => Some(None),
@@ -2528,6 +2684,45 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     Some((p, n)) if commands <= n => p,
                     _ => return Err("its arguments are not in a console buffer in unified memory".into()),
                 };
+                if tp.one_pass {
+                    // (local) one pass: the arguments rewritten as for two passes (groups in X, at
+                    // most 65 535 a command, none past the count; the mesh copies at `count · stride`),
+                    // then the draws alone – no compute pass, no record buffer, no barriers between
+                    let count = match (count_buf, count_at) {
+                        (0, _) => None,
+                        (_, Some(p)) => Some(p),
+                        _ => return Err("its count is not in a console buffer in unified memory".into()),
+                    };
+                    // (the batch's commands are in one copy; a pass of its own makes two; the block
+                    // stays INDIRECT_ARGUMENT either way: the next rewrite puts it back)
+                    let (scaled, first) = match batched_args(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, None, 65_535) {
+                        Some(r) => r,
+                        None => {
+                            let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, 1, 65_535, true)?;
+                            (scaled, at + commands as u64)
+                        }
+                    };
+                    let t = super::gpu_profile::begin(this, raw_pso, super::gpu_profile::Kind::IndirectOnePass, [max, 0, 0]);
+                    let r = (|| -> Result<(), String> {
+                        bind_one_pass_stage(this, list, pso, &tp)?;
+                        match plain_two_pass_signatures(sig) {
+                            Some((_, mesh)) => {
+                                for k in 0..max as u64 {
+                                    // (trace: each command its own slice – its groups start at 0 again)
+                                    if k > 0 && crate::gpu::recomp::emit::mesh_trace() {
+                                        let dev = super::real::list_device(this).ok_or("no device")?;
+                                        list.SetGraphicsRootUnorderedAccessView(6, next_trace_slice(&dev, pso).ok_or("no trace buffer")?);
+                                    }
+                                    pc(this, mesh, 1, scaled.as_raw() as usize, first + k * msig.byte_stride as u64 + msig.mesh_offset as u64, 0, 0);
+                                }
+                            }
+                            None => pc(this, sig, max, scaled.as_raw() as usize, first, 0, 0),
+                        }
+                        Ok(())
+                    })();
+                    super::gpu_profile::end(this, t);
+                    return r;
+                }
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
                 let batch = two_pass_batch();
                 let (res_buf, res_va, region, records) = records_for(this, indirect_record_need(record_bytes, tp.mesh_groups_per_record), batch)?;
@@ -5585,7 +5780,7 @@ void main(uint t : SV_GroupIndex) {
     fn dummy_draw() -> DeferredDraw {
         DeferredDraw {
             snap: snap(0, None),
-            _tp: Arc::new(super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" }),
+            _tp: Arc::new(super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS", one_pass: false }),
             _mesh_pso: None,
             _block: None,
             raw_pso: 0,
@@ -5753,7 +5948,7 @@ void main(uint t : SV_GroupIndex) {
         let list = 0x7500_0031usize as *mut c_void;
         let draw = || DeferredDraw {
             snap: snap(0, None),
-            _tp: Arc::new(super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" }),
+            _tp: Arc::new(super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS", one_pass: false }),
             _mesh_pso: None,
             _block: None,
             raw_pso: 0,
@@ -6132,7 +6327,7 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             let this = &*fake as *const FakeList as *mut c_void;
             let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this).unwrap();
             // no root signatures: the bind stops before it records anything else
-            let tp = super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" };
+            let tp = super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS", one_pass: false };
             for compute_pass in [true, false] {
                 super::super::list_x::set_descriptor_heaps_x(this, 0, std::ptr::null());
                 assert!(super::super::list_x::bound_heaps(this, false).is_empty());

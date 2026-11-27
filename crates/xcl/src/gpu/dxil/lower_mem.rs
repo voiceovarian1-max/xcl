@@ -2494,7 +2494,8 @@ impl Lw {
     /// Mesh mode `s_sendmsg`: GS_ALLOC_REQ (M0 = primitives << 12 | vertices) into the
     /// record header by lane 0 of each wave.
     pub fn mesh_sendmsg(&mut self, d: &Decoded) -> LResult<()> {
-        if Self::fv(d, "SIMM16") & 0xF != 9 {
+        // (one pass: the counts are the maxima, `mesh_prologue`)
+        if Self::fv(d, "SIMM16") & 0xF != 9 || self.mesh.as_ref().is_some_and(|m| m.one.is_some()) {
             return Ok(());
         }
         let m0 = self.sreg(124);
@@ -2530,12 +2531,16 @@ impl Lw {
             }
         };
         let enabled = |c: usize| if compr { en >> (c / 2 * 2) & 3 != 0 } else { en >> c & 1 == 1 };
-        let (vtx, prm, vok, pok) = {
+        let (vtx, prm, vok, pok, one) = {
             let m = self.mesh.as_ref().expect("mesh");
-            (m.vtx, m.prm, m.vok, m.pok)
+            (m.vtx, m.prm, m.vok, m.pok, m.one.is_some())
         };
-        // (dword index in res, value)
+        if one && tgt == 20 {
+            return self.mesh_one_prim(srcs[0]);
+        }
+        // (dword index in res, value); one pass: (record slot – None: the position – component)
         let mut st: Vec<(Value, Value)> = Vec::new();
+        let mut keys: Vec<(Option<usize>, usize)> = Vec::new();
         match tgt {
             12 => {
                 for c in 0..4 {
@@ -2543,6 +2548,7 @@ impl Lw {
                         let at = self.addc(vtx, c as u32);
                         let v = comp(self, c);
                         st.push((at, v));
+                        keys.push((None, c));
                     }
                 }
             }
@@ -2577,6 +2583,7 @@ impl Lw {
                                     let v = unpack_half(self, raw, ct);
                                     let a = self.addc(vtx, (4 * (j + 1) + c) as u32);
                                     st.push((a, v));
+                                    keys.push((Some(j), c));
                                 }
                             }
                         }
@@ -2590,6 +2597,7 @@ impl Lw {
                                 let raw = comp(self, c);
                                 let v = if compr { unpack_half(self, raw, ct) } else { raw };
                                 st.push((a, v));
+                                keys.push((Some(j), c));
                             }
                         }
                     }
@@ -2600,6 +2608,10 @@ impl Lw {
         }
         if st.is_empty() {
             return Ok(());
+        }
+        if one {
+            let st: Vec<(Option<usize>, usize, Value)> = keys.iter().zip(&st).map(|(&(j, c), &(_, v))| (j, c, v)).collect();
+            return self.mesh_one_export(tgt == 12, &st);
         }
         let res = self.res.expect("res");
         let act = self.act();

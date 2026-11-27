@@ -76,6 +76,10 @@ pub struct MeshCtx {
     pub vok: Value,
     pub pok: Value,
     pub outputs: Vec<crate::gpu::dxbc::SigElement>,
+    /// the console thread's index in its group: its vertex and its primitive
+    pub slot: Value,
+    /// (local) one pass (`kernel::MeshOne`): the mesh shader's own outputs instead of the record
+    pub one: Option<super::lower_gfx::MeshOut>,
 }
 
 /// Initial register values: loaded from `io` in the entry block on first use.

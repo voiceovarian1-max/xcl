@@ -4831,6 +4831,29 @@ unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::Sta
     }
 }
 
+/// (local, `XCL_MESH_TRACE=1`) `abi_rs_for` with the trace parameter (`pso::abi_root_signature_traced`).
+unsafe fn abi_rs_traced(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> Option<*mut c_void> {
+    static TRACED: Mutex<Option<HashMap<Vec<u32>, usize>>> = Mutex::new(None);
+    let key: Vec<u32> = samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect();
+    let mut g = TRACED.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    if let Some(&rs) = map.get(&key) {
+        return Some(rs as *mut c_void);
+    }
+    let dev = ID3D12Device::from_raw_borrowed(&this)?;
+    match crate::gpu::recomp::pso::abi_root_signature_traced(dev, samplers) {
+        Ok(rs) => {
+            let raw = rs.into_raw();
+            map.insert(key, raw as usize);
+            Some(raw)
+        }
+        Err(e) => {
+            note_translation_error(format!("traced one-pass root signature: {e}"));
+            None
+        }
+    }
+}
+
 /// XCL ABI root signature, created once on the backend device.
 unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
     let cur = ABI_RS.load(Ordering::Acquire);
@@ -7439,6 +7462,9 @@ pub struct TwoPassPso {
     pub mesh_groups_per_record: u32,
     /// "MS" or "GS"
     pub kind: &'static str,
+    /// (local) one pass (`pso::console_mesh_one`, `XCL_MESH_ONE_PASS=1`): the title's pipeline is
+    /// the console program as a mesh shader; no compute pass (`compute` 0), no records
+    pub one_pass: bool,
 }
 
 impl Drop for TwoPassPso {
@@ -7479,6 +7505,7 @@ pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
                 record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64 },
                 mesh_groups_per_record: 1,
                 kind,
+                one_pass: false,
             }),
         );
     }
@@ -7881,10 +7908,59 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 
     *ppv = mesh_pso.into_raw();
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute.into_raw() as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute.into_raw() as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, one_pass: false }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 || pso_trace() {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (NGG compute {} B, blob reused: {cs_reused}; passthrough mesh graphics {} B, blob reused: {mesh_reused})", tp.cs.len(), tp.ms.len());
+    }
+    hr
+}
+
+/// (local) One-pass mesh pipeline → its console MS (`fnv64`), for the trace dump.
+static ONE_PASS_MS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+pub(super) fn one_pass_ms_hash(pso: usize) -> u64 {
+    ONE_PASS_MS.lock().unwrap().as_ref().and_then(|m| m.get(&pso).copied()).unwrap_or(0)
+}
+
+/// (local) One-pass mesh pipelines made, and those that went to two passes (translation refused
+/// or the driver refused the pipeline).
+static ONE_PASS_MADE: AtomicU64 = AtomicU64::new(0);
+static ONE_PASS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+fn note_one_pass_refusal(why: &str) {
+    let n = ONE_PASS_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: mesh pipeline in two passes, not one (#{n}; {} in one pass so far): {}", ONE_PASS_MADE.load(Ordering::Relaxed), why.lines().next().unwrap_or(""));
+    }
+}
+
+/// (local) The one-pass mesh pipeline (`pso::console_mesh_one`; `stream` with the RS and shaders
+/// in it), registered as a `TwoPassPso` with no compute pass (`one_pass`). On a driver refusal
+/// nothing is registered and `*ppv` is null: the caller takes the two passes.
+unsafe fn finish_one_pass(this: *mut c_void, stream: &StreamOut, record: crate::gpu::recomp::MsInterface, rs: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+    let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
+    let bytes = stream.shader_bytes();
+    let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let _slot = gate.then(|| huge_compile_turn(bytes));
+    let hr = driver_compile_identified("MS one pass", bytes, false, None, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv)).0;
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+        note_one_pass_refusal(&format!("the driver rejected the one-pass mesh pipeline ({hr:#x})"));
+        if !ppv.is_null() {
+            *ppv = std::ptr::null_mut();
+        }
+        return E_INVALIDARG;
+    }
+    let pso = *ppv;
+    note_pso_rs(pso, rs);
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+        pso as usize,
+        std::sync::Arc::new(TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: rs as usize, record, mesh_groups_per_record: 1, kind: "MS", one_pass: true }),
+    );
+    let n = ONE_PASS_MADE.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 5 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: pipeline from the console MS in one pass (#{n}, {bytes} B DXIL; {} went to two passes)", ONE_PASS_REFUSED.load(Ordering::Relaxed));
     }
     hr
 }
@@ -8083,20 +8159,13 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let console_ps = ps;
-    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
-        (Ok(tp), Ok(ps)) => (tp, ps),
-        (Err(e), _) => {
-            note_translation_error(format!("MS: {e}"));
-            return Some(E_INVALIDARG);
-        }
-        (_, Err(e)) => {
+    let (ps, ps_samplers) = match two_pass_ps(ps, graphics_wave32(this)) {
+        Ok(ps) => ps,
+        Err(e) => {
             note_translation_error(e);
             return Some(E_INVALIDARG);
         }
     };
-    let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
-    // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
-    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
     // Extract PC-mapped render target formats upfront so BLEND (type 8) can be sanitized for
     // integer RTVs regardless of subobject order in the stream.
     let mut rt_count = 0u32;
@@ -8108,6 +8177,8 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         }
         rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
     }
+    // the title's state (blend, rasteriser, depth, formats …) after XCL's RS and shaders
+    let title_state = |out: &mut StreamOut| {
     for (ty, payload) in &subs {
         let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
         if !skip {
@@ -8136,6 +8207,44 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
+    };
+    // (local) `XCL_MESH_ONE_PASS=1`: the console program as the mesh shader itself (its static
+    // samplers after the PS's), else (refused, or the driver refuses the pipeline) two passes
+    if crate::gpu::recomp::pso::mesh_one_pass_enabled() {
+        match crate::gpu::recomp::pso::console_mesh_one(ms, console_ps, wave32_only(this), ps_samplers.len() as u32) {
+            Ok((msd, ms_samplers, record)) => {
+                let samplers: Vec<_> = ps_samplers.iter().chain(&ms_samplers).cloned().collect();
+                let rs = if crate::gpu::recomp::emit::mesh_trace() { abi_rs_traced(this, &samplers) } else { abi_rs_for(this, &samplers) };
+                if let Some(rs) = rs {
+                    let mut out = two_pass_mesh_stream(rs, &msd, ps.as_deref());
+                    title_state(&mut out);
+                    let hr = finish_one_pass(this, &out, record, rs, riid, ppv);
+                    if hr >= 0 {
+                        // (the DXIL's hash as vkd3d-proton names it: FNV-1, in breadcrumb reports)
+                        let fnv1 = msd.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| h.wrapping_mul(0x100_0000_01b3) ^ b as u64);
+                        crate::xlog_info!("D3D12.X: one-pass MS {:016x} (PS {:016x}): mesh shader DXIL {fnv1:016x} (vkd3d hash), {} B", crate::gpu::shader::fnv64(ms), console_ps.map_or(0, crate::gpu::shader::fnv64), msd.len());
+                        ONE_PASS_MS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, crate::gpu::shader::fnv64(ms));
+                        super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
+                        if super::gpu_times::enabled() {
+                            PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(ms), console_ps.map_or(0, crate::gpu::shader::fnv64)));
+                        }
+                        return Some(hr);
+                    }
+                }
+            }
+            Err(e) => note_one_pass_refusal(&e),
+        }
+    }
+    let tp = match console_mesh(ms, console_ps, wave32_only(this)) {
+        Ok(tp) => tp,
+        Err(e) => {
+            note_translation_error(format!("MS: {e}"));
+            return Some(E_INVALIDARG);
+        }
+    };
+    let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
+    title_state(&mut out);
     let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
@@ -9786,6 +9895,9 @@ pub fn log_device_removed() {
     let (commit, limit) = crate::host::system_commit();
     if limit != 0 {
         crate::xlog_error!("system commit at the removal: {} of {} MB ({} MB left)", commit >> 20, limit >> 20, limit.saturating_sub(commit) >> 20);
+    }
+    if crate::gpu::recomp::emit::mesh_trace() {
+        super::bind::dump_one_pass_traces();
     }
     unsafe {
         // (DRED 1.2: 3 hung, 6 fault, 7 page fault; 0 when the removal did not come from work

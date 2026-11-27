@@ -67,6 +67,176 @@ fn out_comps(e: &SigElement) -> u8 {
     }
 }
 
+/// (local) A one-pass mesh shader's outputs (`kernel::MeshOne`): SV_Position, then what the
+/// pixel shader reads, declared as `emit::mesh_passthrough_for` declares them (so they pack and
+/// link as the pass-through did), each with the record slot (`ranked(outputs, true)`) of the
+/// program's output that feeds it.
+pub struct MeshOut {
+    pub io: GraphicsIo,
+    pub pos: Sig,
+    /// (element, the record slot that feeds it – None: none, it is written 0 – columns)
+    pub elems: Vec<(Sig, Option<usize>, u8)>,
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    pub threads: u32,
+}
+
+impl Lw {
+    /// The outputs of a one-pass mesh shader for the pixel shader inputs `ps_inputs` (None: every
+    /// output of the program, as a VS declares them).
+    pub fn mesh_outputs(&mut self, ms: &crate::gpu::recomp::MsInterface, ps_inputs: Option<&[SigElement]>) -> MeshOut {
+        let mut io = GraphicsIo::new(super::container::Stage::Mesh);
+        let pos = io.output(GSig::new("SV_Position", 0, SemKind::Position, GCt::F32, 4));
+        let slots = ranked(&ms.outputs, true);
+        let clip = |e: &SigElement| match e.system_value {
+            2 => Some(SemKind::ClipDistance),
+            3 => Some(SemKind::CullDistance),
+            _ => None,
+        };
+        let mut elems = Vec::new();
+        match ps_inputs {
+            None => {
+                for (k, e) in slots.iter().enumerate() {
+                    let n = out_comps(e);
+                    let s = io.output(GSig::new(&e.name, e.index, clip(e).unwrap_or(SemKind::Arbitrary), gct(e.component_type), n));
+                    elems.push((s, Some(k), n));
+                }
+            }
+            Some(ins) => {
+                for e in ranked(ins, false) {
+                    let k = slots.iter().position(|o| o.system_value == 0 && o.name.eq_ignore_ascii_case(&e.name) && o.index == e.index);
+                    let s = io.output(GSig::user(&e.name, e.index, gct(e.component_type), 4));
+                    elems.push((s, k, 4));
+                }
+                for (k, o) in slots.iter().enumerate() {
+                    if let Some(kind) = clip(o) {
+                        let n = out_comps(o);
+                        let s = io.output(GSig::new(&o.name, o.index, kind, gct(o.component_type), n));
+                        elems.push((s, Some(k), n));
+                    }
+                }
+            }
+        }
+        MeshOut { io, pos, elems, max_vertices: ms.max_vertices, max_primitives: ms.max_primitives, threads: ms.threads.max(1) }
+    }
+
+    fn mesh_out(&mut self) -> (&mut super::shader::Shader, &mut MeshOut) {
+        let Lw { s, mesh, .. } = self;
+        (s, mesh.as_mut().and_then(|m| m.one.as_mut()).expect("one-pass mesh shader"))
+    }
+
+    /// One-pass mesh shader, before the program: the output counts and every primitive culled
+    /// (all indices 0: no area), so the primitives no thread exports draw nothing. The counts are
+    /// the maxima: the program's own come from one lane's GS_ALLOC_REQ, and DXIL wants one call,
+    /// in uniform control flow, before every output write (cool_fox `mesh_prologue` does the same;
+    /// the host then sets up the unused primitive slots).
+    pub fn mesh_prologue(&mut self) -> LResult<()> {
+        let slot = self.mesh.as_ref().expect("mesh").slot;
+        let (mv, mp, t) = {
+            let o = self.mesh_out().1;
+            (o.max_vertices, o.max_primitives, o.threads)
+        };
+        let (v, p) = (self.c(mv), self.c(mp));
+        let (s, o) = self.mesh_out();
+        o.io.set_mesh_output_counts(s, v, p);
+        let z = self.c(0);
+        // thread n culls primitives n, n + threads, … (a count past the threads)
+        for pass in 0..mp.div_ceil(t) {
+            let index = if pass == 0 { slot } else { self.addc(slot, pass * t) };
+            let mut cull = |lw: &mut Lw| -> LResult<()> {
+                let (s, o) = lw.mesh_out();
+                o.io.emit_indices(s, index, &[z, z, z]);
+                Ok(())
+            };
+            if (pass + 1) * t <= mp {
+                cull(self)?;
+            } else {
+                let inside = self.cmpc(Pred::ULt, index, mp);
+                self.guarded(inside, &mut cull)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One-pass mesh `exp pos0` / `exp param<n>` into this thread's vertex: `st` = (record slot –
+    /// None: the position – component, value). With the position, the elements no output feeds
+    /// get 0 (as the pass-through reads them).
+    pub fn mesh_one_export(&mut self, pos: bool, st: &[(Option<usize>, usize, Value)]) -> LResult<()> {
+        let slot = self.mesh.as_ref().expect("mesh").slot;
+        let (mv, t, pos_sig, elems) = {
+            let o = self.mesh_out().1;
+            (o.max_vertices, o.threads, o.pos, o.elems.clone())
+        };
+        let act = self.act();
+        let g = if t > mv {
+            let inside = self.cmpc(Pred::ULt, slot, mv);
+            self.land(act, inside)
+        } else {
+            act
+        };
+        let z = self.c(0);
+        self.guarded(g, &mut |lw| {
+            let (s, o) = lw.mesh_out();
+            for &(j, c, v) in st {
+                let c = c as u8;
+                match j {
+                    None => o.io.store_vertex_output(s, pos_sig, 0, c, v, slot),
+                    Some(j) => {
+                        for &(sig, _, _) in elems.iter().filter(|e| e.1 == Some(j) && c < e.2) {
+                            o.io.store_vertex_output(s, sig, 0, c, v, slot);
+                        }
+                    }
+                }
+            }
+            if pos {
+                for &(sig, _, n) in elems.iter().filter(|e| e.1.is_none()) {
+                    for c in 0..n {
+                        o.io.store_vertex_output(s, sig, 0, c, z, slot);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// One-pass mesh `exp prim`: this thread's primitive. A corner is the 9 bits under its edge
+    /// flag (bits 9, 19, 29); bit 31, or a corner past the vertices the threads write, culls it
+    /// (indices 0), as the pass-through and cool_fox `emit_indices` do.
+    pub fn mesh_one_prim(&mut self, p: Value) -> LResult<()> {
+        let slot = self.mesh.as_ref().expect("mesh").slot;
+        let (mv, mp, t) = {
+            let o = self.mesh_out().1;
+            (o.max_vertices, o.max_primitives, o.threads)
+        };
+        let act = self.act();
+        let g = if t > mp {
+            let inside = self.cmpc(Pred::ULt, slot, mp);
+            self.land(act, inside)
+        } else {
+            act
+        };
+        let written = mv.min(t);
+        self.guarded(g, &mut |lw| {
+            let mut culled = lw.cmpc(Pred::SLt, p, 0);
+            let mut idx = [p; 3];
+            for (k, i) in idx.iter_mut().enumerate() {
+                let x = lw.lshrc(p, 10 * k as u32);
+                let x = lw.andc(x, 0x1FF);
+                let past = lw.cmpc(Pred::UGe, x, written);
+                culled = lw.lor(culled, past);
+                *i = x;
+            }
+            let z = lw.c(0);
+            for i in idx.iter_mut() {
+                *i = lw.sel(culled, z, *i);
+            }
+            let (s, o) = lw.mesh_out();
+            o.io.emit_indices(s, slot, &idx);
+            Ok(())
+        })
+    }
+}
+
 impl Lw {
     fn gfx(&mut self) -> &mut GfxCtx {
         self.gfx.as_mut().expect("graphics entry")

@@ -3629,7 +3629,7 @@ fn gpu_mesh_mode_two_passes() {
     if !gpu_ready() || !mesh_ready() {
         return;
     }
-    use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
+    use super::{dxc, mesh_passthrough, MESH_HEADER};
     let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
         name: name.into(),
         index: 0,
@@ -3640,37 +3640,7 @@ fn gpu_mesh_mode_two_passes() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
-    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
-        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
-    };
-    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
-        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)), // wave index
-        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
-        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
-        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None), // thread in group
-        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
-        ("S_LSHR_B32", "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 135)], None), // group = v5 >> 7
-        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)), // 1 primitive, 3 vertices
-        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
-        ("S_BARRIER", "ENC_SOPP", vec![], None),
-        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 131), ("VSRC1", 0)], None), // threads 0..2
-        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
-        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 20), ("SRC0", 1)], None),
-        ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 10), ("SRC0", V + 20), ("VSRC1", 10)], None), // x += group
-        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", V + 20)], None),
-        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", V)], None),
-        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 128)], None),
-        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 17), ("SRC0", 242)], None),
-    ];
-    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
-    list.push(exp(32, 0xF, [14, 15, 16, 17], 0));
-    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
-    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None)); // thread 0
-    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10 | 2 << 20)));
-    list.push(exp(20, 1, [21, 0, 0, 0], 1));
-    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
-    let code = prog(&refs);
+    let (code, ms, mem, sg) = ngg_test_program();
     let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
     let t = translate(&code, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
@@ -3679,13 +3649,6 @@ fn gpu_mesh_mode_two_passes() {
     let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
     let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
     let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
-    // vertex table at byte 0x100, V# in s[16:19] (stride 16, 3 records)
-    let mut mem = vec![0u32; 256];
-    for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
-        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(*x), f(*y), f(0.0), f(1.0)]);
-    }
-    let mut sg = vec![0u32; 128];
-    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
     let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
     for g in 0..2usize {
@@ -3799,6 +3762,212 @@ fn gpu_mesh_mode_exports_stay_inside_the_record() {
         assert_eq!(rec[MESH_HEADER + 64 * vd + p], MARK, "primitive {p} of the record");
     }
     assert_eq!(rec[rd..].iter().position(|&w| w != 0), None, "a thread past the record's slots wrote behind it");
+}
+
+/// The NGG program of `gpu_mesh_mode_two_passes` (wave index from s3, group from v5 >> 7,
+/// GS_ALLOC_REQ, exp pos0/param0/prim, two waves per group: 3 vertices and 1 triangle a group)
+/// with its interface, memory (vertex table at byte 0x100) and SGPRs (V# in s[16:19]).
+fn ngg_test_program() -> (Vec<u8>, super::MsInterface, Vec<u32>, Vec<u32>) {
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = super::MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)), // wave index
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None), // thread in group
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
+        ("S_LSHR_B32", "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 135)], None), // group = v5 >> 7
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)), // 1 primitive, 3 vertices
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 131), ("VSRC1", 0)], None), // threads 0..2
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 20), ("SRC0", 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 10), ("SRC0", V + 20), ("VSRC1", 10)], None), // x += group
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", V + 20)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", V)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 17), ("SRC0", 242)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0xF, [14, 15, 16, 17], 0));
+    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
+    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None)); // thread 0
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10 | 2 << 20)));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    // vertex table at byte 0x100, V# in s[16:19] (stride 16, 3 records)
+    let mut mem = vec![0u32; 256];
+    for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(*x), f(*y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
+    (code, ms, mem, sg)
+}
+
+/// (local) A split-wave64 one-pass mesh program of two console waves without LDS runs them one
+/// after the other in a group of one console wave (`Em::mesh_one_wave`): no barrier rounds, every
+/// group sync reached by the whole group.
+#[test]
+fn one_pass_mesh_runs_console_waves_in_turn() {
+    let (code, ms, _, _) = ngg_test_program();
+    let opt = Options { mode: Mode::Mesh(ms), wave64: true, split_wave64: true, mesh_one: Some(super::MeshOnePass { ps_inputs: None, lds_bytes: 0 }), ..Default::default() };
+    let h = translate(&code, &opt).unwrap().hlsl;
+    assert!(h.contains("[numthreads(64, 1, 1)]"), "{h}");
+    assert!(h.contains("for (uint xcl_c = 0u; xcl_c < 2u; xcl_c++)"), "{h}");
+    assert!(h.contains("#define XCL_X_THREADS 64u"), "{h}");
+    assert!(!h.contains("xcl_s_barrier"), "{h}");
+}
+
+/// (local) The same program as one mesh shader (`kernel::translate_mesh_one`: no compute pass,
+/// no records) draws the pixels the two passes draw; on a GPU with 32-lane waves only, where
+/// XCL uses it (wave64 in the split form).
+#[test]
+fn gpu_mesh_mode_one_pass_draws_as_two_passes() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    if !runner::split_wave64() {
+        runner::skip_test("no GPU with 32-lane waves only");
+        return;
+    }
+    use crate::gpu::dxil::kernel::{translate_mesh_one, KernelOptions, MeshOne};
+    use super::{dxc, mesh_passthrough};
+    let (code, ms, mem, sg) = ngg_test_program();
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
+    let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
+    let msb = dxc::compile(&mesh_passthrough(&ms), "main", "ms_6_6", &[]).unwrap();
+    let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let (two, _) = runner::mesh_draw(&cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    let ins = crate::gpu::dxbc::signatures(&ps).0;
+    assert!(ins.iter().any(|e| e.name == "TEXCOORD"), "the PS's inputs: {ins:?}");
+    for ps_inputs in [Some(ins), None] {
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let one = MeshOne { ms: ms.clone(), ps_inputs: ps_inputs.clone(), lds_bytes: 0 };
+        let k = translate_mesh_one(&code, o, &one, &[]).unwrap_or_else(|e| panic!("{e}"));
+        // the HLSL path's form (`Options::mesh_one`; no LDS: one console wave at a time)
+        let hopt = Options { mode: Mode::Mesh(ms.clone()), wave64: true, split_wave64: true, mesh_one: Some(super::MeshOnePass { ps_inputs: ps_inputs.clone(), lds_bytes: 0 }), ..Default::default() };
+        let h = translate(&code, &hopt).unwrap();
+        if std::env::var_os("XCL_TEST_DUMP").is_some() {
+            println!("{}", h.hlsl);
+        }
+        assert!(h.complete(), "{:?}", h.unsupported_why);
+        let hms = dxc::compile(&h.hlsl, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", h.hlsl));
+        for (form, dxil) in [("direct", &k.dxil), ("HLSL", &hms)] {
+            let t = std::time::Instant::now();
+            let (px, _) = runner::mesh_draw(&[], dxil, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+            println!("{form}: {:.1} ms (pipeline and draw)", t.elapsed().as_secs_f64() * 1e3);
+            let at = |x: usize, y: usize| px[y * 32 + x];
+            assert_eq!((at(3, 29)[0], at(3, 29)[3]), (0.0, 1.0), "{form}: group 0 triangle (left), PS inputs {}", ps_inputs.is_some());
+            assert_eq!((at(19, 29)[0], at(19, 29)[3]), (1.0, 1.0), "{form}: group 1 triangle (right)");
+            assert!(px == two, "{form}: one pass draws the two passes' pixels");
+        }
+    }
+}
+
+/// (local, a probe of the driver) Groupshared words a mesh shader set, read back after it wrote
+/// its outputs: run 190 and `sample_pack_one_pass_mesh_timing` pointed at output writes made after
+/// a group's storage is set up breaking the waves' waits on it. Prints the words that changed
+/// (`XCL_MESH_PROBE_ORDER`: `before` writes the outputs before the sentinels).
+#[test]
+fn gpu_mesh_output_writes_and_groupshared_probe() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::dxc;
+    let before = std::env::var("XCL_MESH_PROBE_ORDER").is_ok_and(|v| v == "before");
+    let outputs = "    tris[gi] = uint3(gi, gi, gi);\n    verts[gi].pos = float4(1.0, 2.0, 3.0, 4.0);\n    verts[gi].p0 = float4(5.0, 6.0, 7.0, 8.0);\n";
+    let src = format!(
+        r#"RWByteAddressBuffer io : register(u1);
+groupshared uint g[{n}];
+struct V {{ float4 pos : SV_Position; float4 p0 : TEXCOORD0; }};
+[outputtopology("triangle")]
+[numthreads(128, 1, 1)]
+void main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices V verts[128], out indices uint3 tris[128])
+{{
+    SetMeshOutputCounts(128u, 128u);
+{pre}    for (uint i = gi; i < {n}u; i += 128u) g[i] = 0xA5A50000u + i;
+    GroupMemoryBarrierWithGroupSync();
+{post}    GroupMemoryBarrierWithGroupSync();
+    if (gid.x == 0u) for (uint j = gi; j < {n}u; j += 128u) io.Store(j * 4u, g[j]);
+}}
+"#,
+        n = 1024,
+        pre = if before { outputs } else { "" },
+        post = if before { "" } else { outputs },
+    );
+    let ms = dxc::compile(&src, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{src}"));
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n", "main", "ps_6_6", &[]).unwrap();
+    let (_, rec) = runner::mesh_draw(&[], &ms, &ps, 4, 1024, &[0u32; 128], &[0u32; 64], 16, [0.0; 4]).unwrap();
+    let changed: Vec<(usize, u32)> = (0..1024).filter(|&j| rec[j] != 0xA5A5_0000 + j as u32).map(|j| (j, rec[j])).collect();
+    println!("mesh output writes {} the sentinels: {} of 1024 groupshared words changed; first: {:x?}", if before { "before" } else { "after" }, changed.len(), &changed[..changed.len().min(12)]);
+}
+
+/// (local) Do group syncs at different code sites pair in a 128-thread mesh shader? Threads 0-63
+/// and 64-127 take different branches (decided by data the compiler cannot see), each with the
+/// same number of syncs. A one-pass mesh program whose console waves diverge around meets needs
+/// them to pair (run 202: they did not, the GPU hung). `XCL_MESH_PROBE_SITES=same` is the control.
+#[test]
+fn gpu_mesh_syncs_at_different_sites_probe() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::dxc;
+    let same = std::env::var("XCL_MESH_PROBE_SITES").is_ok_and(|v| v == "same");
+    let body = if same {
+        "    g[gi] = 1u + gi;\n    GroupMemoryBarrierWithGroupSync();\n    uint r = g[(gi + 64u) & 127u];\n    GroupMemoryBarrierWithGroupSync();\n    if (a) r += 1000u;\n"
+    } else {
+        "    uint r;\n    [branch] if (a) {\n        g[gi] = 1u + gi;\n        GroupMemoryBarrierWithGroupSync();\n        r = g[(gi + 64u) & 127u] + 1000u;\n        GroupMemoryBarrierWithGroupSync();\n    } else {\n        g[gi] = 1u + gi * 3u;\n        GroupMemoryBarrierWithGroupSync();\n        r = g[(gi + 64u) & 127u] ^ 0x55u;\n        GroupMemoryBarrierWithGroupSync();\n    }\n"
+    };
+    let src = format!(
+        r#"RWByteAddressBuffer io : register(u1);
+groupshared uint g[128];
+struct V {{ float4 pos : SV_Position; float4 p0 : TEXCOORD0; }};
+[outputtopology("triangle")]
+[numthreads(128, 1, 1)]
+void main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices V verts[128], out indices uint3 tris[128])
+{{
+    SetMeshOutputCounts(128u, 128u);
+    tris[gi] = uint3(0u, 0u, 0u);
+    verts[gi].pos = float4(0.0, 0.0, 0.0, 1.0);
+    verts[gi].p0 = float4(0.0, 0.0, 0.0, 0.0);
+    bool a = (gi >> 6) == (io.Load(1020u) & 1u);
+{body}    if (gid.x == 0u) io.Store(gi * 4u, r);
+}}
+"#
+    );
+    let ms = dxc::compile(&src, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{src}"));
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n", "main", "ps_6_6", &[]).unwrap();
+    let t = std::time::Instant::now();
+    let got = runner::mesh_draw(&[], &ms, &ps, 1, 256, &[0u32; 128], &[0u32; 64], 16, [0.0; 4]);
+    let ms_taken = t.elapsed().as_secs_f64() * 1e3;
+    match got {
+        Ok((_, rec)) => {
+            let want = |i: u32| {
+                let o = (i + 64) & 127;
+                if same { o + 1 + if i < 64 { 1000 } else { 0 } } else if i < 64 { o * 3 + 1 + 1000 } else { (o + 1) ^ 0x55 }
+            };
+            let wrong = (0..128u32).filter(|&i| rec[i as usize] != want(i)).count();
+            println!("mesh syncs at {} sites: finished in {ms_taken:.1} ms, {wrong} of 128 results wrong; 0..4 {:x?}, 64..68 {:x?}, io[255] {:x}", if same { "the same" } else { "different" }, &rec[..4], &rec[64..68], rec[255]);
+        }
+        Err(e) => println!("mesh syncs at {} sites: failed after {ms_taken:.1} ms: {e}", if same { "the same" } else { "different" }),
+    }
 }
 
 #[test]

@@ -112,6 +112,15 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                // (local, `XCL_MESH_TRACE=1`: presents stopped after frames had come – the one-pass
+                // mesh trace now, at most three times; a GPU stall can end in the title's own crash
+                // reporter before any device loss)
+                if crate::gpu::recomp::emit::mesh_trace() && d[0] == 0 && now[0] > 0 {
+                    static DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                        crate::hle::d3d12x::bind::dump_one_pass_traces();
+                    }
+                }
                 // the time the title's threads spent in some of XCL's calls
                 let line = |spent: &[(u64, u64)], before: &[(u64, u64)]| -> Vec<String> {
                     crate::hle::api_cost::CALLS

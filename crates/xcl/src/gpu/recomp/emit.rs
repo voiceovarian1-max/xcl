@@ -76,6 +76,12 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// (local) one-pass mesh: the depth of the block where `GS_ALLOC_REQ` was sent, while it lasts
+    /// (`s_barrier`s in it are left out: `mesh_alloc_barrier`)
+    alloc_indent: Option<usize>,
+    /// (local) one-pass mesh, split wave64: the mesh group is one console wave's two halves, and
+    /// the program runs once per console wave of its group (`configure_round_modes`)
+    mesh_one_wave: bool,
     /// the T# SGPRs of the program's image stores and atomics (`image_write_srsrcs`)
     img_writes: Vec<u64>,
     /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
@@ -633,6 +639,8 @@ impl Em {
             dynamic_f16_rm: false,
             track_frexp_denorm: false,
             safe_barrier: false,
+            alloc_indent: None,
+            mesh_one_wave: false,
             img_writes: Vec::new(),
             coherent_mem: false,
             writes_lds: false,
@@ -657,6 +665,7 @@ impl Em {
         self.img_writes = image_write_srsrcs(insts);
         let mut writes_nonzero_dp = false;
         let mut has_s_barrier = false;
+        let mut has_lds = false;
         for d in insts {
             let name = d.inst.name.to_ascii_lowercase();
             if stop_at_endpgm && matches!(name.as_str(), "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done") {
@@ -664,6 +673,9 @@ impl Em {
             }
             if name == "s_barrier" {
                 has_s_barrier = true;
+            }
+            if lds_op(&name) {
+                has_lds = true;
             }
             if matches!(self.opt.mode, Mode::Pixel(_)) && d.enc.name == "ENC_EXP" && rdna2::field_value(d.enc, &d.words, "VM") == Some(1) {
                 self.has_ps_vm = true;
@@ -699,7 +711,21 @@ impl Em {
             }
         }
         self.dynamic_f16_rm = writes_nonzero_dp && self.has_f16_round_op && !self.has_f64_round_op;
-        self.safe_barrier = has_s_barrier
+        // (local) one pass, split wave64: one console wave per mesh group, the program run for
+        // each console wave in turn. An NVIDIA mesh group is one hardware warp running its
+        // invocations in turns, and a branch holding a group sync is taken as the group's
+        // (`gpu_mesh_syncs_at_different_sites_probe`): console waves that branch apart around
+        // meets or barriers broke (run 202, `MS_VS_CascadeShadows`). Its two halves always take
+        // the same branches. Console waves that share LDS stay together (`pso::console_mesh_one`
+        // keeps them in two passes).
+        self.mesh_one_wave = match &self.opt.mode {
+            Mode::Mesh(ms) if self.opt.mesh_one.is_some() && self.x64() => ms.threads <= 64 || (!has_lds && ms.threads % 64 == 0),
+            _ => false,
+        };
+        // (local; a one-pass mesh shader of several console waves: always, its meets are group
+        // syncs a finished wave must join)
+        self.safe_barrier = (has_s_barrier || self.opt.mesh_one.is_some())
+            && !self.mesh_one_wave
             && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
             && safe_barrier_wanted();
         self.m0_bounds = m0_bounds(insts);
@@ -710,6 +736,10 @@ impl Em {
     }
 
     fn line(&mut self, s: &str) {
+        // (the block that sent GS_ALLOC_REQ has ended)
+        if self.alloc_indent.is_some_and(|d| self.indent < d) {
+            self.alloc_indent = None;
+        }
         for _ in 0..self.indent {
             self.out.push_str("    ");
         }
@@ -1261,6 +1291,11 @@ impl Em {
         let name = d.inst.name.to_ascii_lowercase();
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
+        // (trace: the pc of barriers and ends only – a store per instruction made big programs' HLSL
+        // too slow for DXC, run 199)
+        if self.opt.mesh_one.is_some() && mesh_trace() && matches!(name.as_str(), "s_barrier" | "s_endpgm") {
+            self.line(&format!("xcl_tr_pc = 0x{:x}u;", d.pc));
+        }
         self.cur_pc = d.pc;
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
@@ -1311,6 +1346,15 @@ impl Em {
         match name {
             "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Flow::End,
             "s_barrier" => {
+                if self.alloc_indent.is_some_and(|d| self.indent >= d) {
+                    // (local) one-pass mesh: a barrier after GS_ALLOC_REQ in its block orders the
+                    // other waves' exports after the allocation, which a mesh shader made at entry
+                    // (cool_fox `lower.rs` leaves out barriers dominated by GS_ALLOC_REQ). Only the
+                    // waves that allocate run it: kept, it paired with another wave's next barrier
+                    // and hung the GPU (runs 191-194, `MSNC_VS_BakeDecorations`, `MST_DS_PNTri`).
+                    self.line("// (left out: after GS_ALLOC_REQ)");
+                    return Flow::Next;
+                }
                 if self.x64() && matches!(self.opt.mode, Mode::Geometry(_)) {
                     // split ES+GS: the GS phase runs in the lower hardware wave alone (one console
                     // wave: nothing to wait for), a group barrier there would wait for the other
@@ -1354,7 +1398,12 @@ impl Em {
             }
             "s_sendmsg" if matches!(self.opt.mode, Mode::Mesh(_)) => {
                 // GS_ALLOC_REQ: M0 = primitives << 12 | vertices (scalar: whatever EXEC is)
-                if rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) & 0xF == 9 {
+                // (local; one pass: the counts are the maxima, set at entry, and the barriers after
+                // it in its block are left out)
+                if rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) & 0xF == 9 && self.opt.mesh_one.is_some() {
+                    self.alloc_indent = Some(self.indent);
+                }
+                if rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) & 0xF == 9 && self.opt.mesh_one.is_none() {
                     let m0 = self.sreg(124);
                     self.line(&format!(
                         "if (lane_id == 0u) {{ res.Store(xcl_rec * 4u, {m0} & 0x3FFu); res.Store(xcl_rec * 4u + 4u, ({m0} >> 12) & 0x7FFu); }}"
@@ -2335,6 +2384,57 @@ impl Em {
         }
     }
 
+    /// Mesh mode: dword `n` of this thread's vertex in the record (0..3 the position, 4·(j + 1) + c
+    /// component c of record slot j) = `v`. (local) One pass (`Options::mesh_one`): the elements
+    /// of its own vertex that slot feeds instead (`one_pass_vertex`).
+    fn mesh_vtx_store(&self, n: usize, v: &str) -> String {
+        let (Mode::Mesh(ms), Some(one)) = (&self.opt.mode, &self.opt.mesh_one) else {
+            return format!("if (xcl_vok) res.Store((xcl_vtx + {n}u) * 4u, {v});");
+        };
+        let sw = ["x", "y", "z", "w"];
+        let guard = if ms.threads > ms.max_vertices { format!("if (xcl_slot < {}u) ", ms.max_vertices) } else { String::new() };
+        if n < 4 {
+            return format!("{guard}verts[xcl_slot].pos.{} = asfloat({v});", sw[n]);
+        }
+        let (j, c) = (n / 4 - 1, n % 4);
+        let mut s = String::new();
+        for (k, &(slot, comps, ct)) in one_pass_vertex(ms, one.ps_inputs.as_deref()).1.iter().enumerate() {
+            if slot == Some(j) && c < comps {
+                let x = match ct {
+                    1 | 4 => v.to_string(),
+                    2 | 5 => format!("asint({v})"),
+                    _ => format!("asfloat({v})"),
+                };
+                let field = if comps == 1 { format!("p{k}") } else { format!("p{k}.{}", sw[c]) };
+                let _ = write!(s, "{guard}verts[xcl_slot].{field} = {x}; ");
+            }
+        }
+        s
+    }
+
+    /// (local) One-pass mesh, with the position: the vertex elements no output feeds are 0 (as
+    /// the pass-through reads them).
+    fn mesh_one_zeros(&self) -> Option<String> {
+        let (Mode::Mesh(ms), Some(one)) = (&self.opt.mode, &self.opt.mesh_one) else { return None };
+        let guard = if ms.threads > ms.max_vertices { format!("if (xcl_slot < {}u) ", ms.max_vertices) } else { String::new() };
+        let s: String = one_pass_vertex(ms, one.ps_inputs.as_deref()).1.iter().enumerate().filter(|(_, e)| e.0.is_none()).map(|(k, _)| format!("{guard}verts[xcl_slot].p{k} = 0; ")).collect();
+        Some(s)
+    }
+
+    /// Mesh mode `exp prim` = `v` into this thread's primitive. (local) One pass: its indices, the
+    /// 9 bits under each corner's edge flag; bit 31, or a corner past the vertices the threads
+    /// write, culls it (all 0), as the pass-through does.
+    fn mesh_prim_store(&self, v: &str) -> String {
+        let (Mode::Mesh(ms), Some(_)) = (&self.opt.mode, &self.opt.mesh_one) else {
+            return format!("if (xcl_pok) res.Store(xcl_prm * 4u, {v});");
+        };
+        let guard = if ms.threads > ms.max_primitives { format!("if (xcl_slot < {}u) ", ms.max_primitives) } else { String::new() };
+        let w = ms.max_vertices.min(ms.threads);
+        format!(
+            "{{ uint xcl_pp = {v}; uint3 xcl_px = uint3(xcl_pp & 0x1FFu, (xcl_pp >> 10) & 0x1FFu, (xcl_pp >> 20) & 0x1FFu); bool xcl_bad = or((xcl_pp >> 31) != 0u, any(xcl_px >= {w}u)); {guard}tris[xcl_slot] = select(xcl_bad, uint3(0u, 0u, 0u), xcl_px); }}"
+        )
+    }
+
     fn export_graphics(&mut self, d: &Decoded, en: u64, tgt: u64, compr: bool, srcs: &[String]) -> Result<(), &'static str> {
         let act = self.act();
         let done = rdna2::field_value(d.enc, &d.words, "DONE") == Some(1);
@@ -2445,9 +2545,10 @@ impl Em {
             }
             (Mode::Pixel(_), 9) => {}
             (Mode::Mesh(_), 12) => {
+                st.extend(self.mesh_one_zeros());
                 for c in 0..4 {
                     if enabled(c) {
-                        st.push(format!("if (xcl_vok) res.Store((xcl_vtx + {c}u) * 4u, {});", Self::exp_comp(srcs, compr, c)));
+                        st.push(self.mesh_vtx_store(c, &Self::exp_comp(srcs, compr, c)));
                     }
                 }
             }
@@ -2477,7 +2578,7 @@ impl Em {
                                         2 | 5 => format!("(uint)(((int)({raw} << 16)) >> 16)"),
                                         _ => raw,
                                     };
-                                    st.push(format!("if (xcl_vok) res.Store((xcl_vtx + {}u) * 4u, {v});", 4 * (j + 1) + c));
+                                    st.push(self.mesh_vtx_store(4 * (j + 1) + c, &v));
                                 }
                             }
                         }
@@ -2502,13 +2603,13 @@ impl Em {
                                     (2 | 5, true) => format!("(uint)(((int)({raw} << 16)) >> 16)"),
                                     (_, _) => raw,
                                 };
-                                st.push(format!("if (xcl_vok) res.Store((xcl_vtx + {}u) * 4u, {v});", 4 * (j + 1) + c));
+                                st.push(self.mesh_vtx_store(4 * (j + 1) + c, &v));
                             }
                         }
                     }
                 }
             }
-            (Mode::Mesh(_), 20) => st.push(format!("if (xcl_pok) res.Store(xcl_prm * 4u, {});", srcs[0])),
+            (Mode::Mesh(_), 20) => st.push(self.mesh_prim_store(&srcs[0])),
             (Mode::Mesh(_), 9) => {}
             _ => return Err("export target"),
         }
@@ -4902,6 +5003,7 @@ impl Em {
     fn x64_threads(&self) -> u32 {
         match &self.opt.mode {
             Mode::Compute(cs) => cs.threads.iter().product(),
+            Mode::Mesh(ms) if self.mesh_one_wave => ms.threads.min(64),
             Mode::Mesh(ms) => ms.threads,
             _ => 64,
         }
@@ -4924,8 +5026,10 @@ impl Em {
     /// most 8192 (32 KB); 8192 in other modes, for a size not known, or with `XCL_LDS_FIT=0`.
     /// Groups that ask for little LDS then fit many to a GPU core.
     fn lds_words(&self) -> usize {
-        let lds_bytes = match &self.opt.mode {
-            Mode::Compute(cs) if super::lds_fit_enabled() => cs.lds_bytes,
+        // (local) a one-pass mesh shader: always fitted (a mesh shader has 28 KB)
+        let lds_bytes = match (&self.opt.mode, &self.opt.mesh_one) {
+            (Mode::Compute(cs), _) if super::lds_fit_enabled() => cs.lds_bytes,
+            (Mode::Mesh(_), Some(one)) => one.lds_bytes,
             _ => return 8192,
         };
         if lds_bytes == 0 {
@@ -4941,6 +5045,7 @@ impl Em {
         };
         (lds_bytes as usize / 4 + extra).min(8192)
     }
+
     /// Storage and functions of the split wave64 form (`PRELUDE_X64`).
     fn x64_prelude(&self, h: &mut String) {
         let threads = self.x64_threads();
@@ -4964,7 +5069,26 @@ impl Em {
             let _ = writeln!(h, "groupshared uint xcl_xs[{slots}];\ngroupshared uint xcl_xc[{counters}];\ngroupshared uint xcl_xw;");
             h.push_str("#define XCL_XS(i) xcl_xs[(i)]\n#define XCL_XC(i) xcl_xc[(i)]\n#define XCL_XW xcl_xw\n");
         }
-        h.push_str(PRELUDE_X64);
+        if self.opt.mesh_one.is_some() && mesh_round_barrier() {
+            // (local) `XCL_MESH_ROUND_BARRIER=1`, a one-pass mesh shader: no spinning meet
+            // (`PRELUDE_ROUND_BARRIER`); a pair of group syncs, every wave at every meet (the
+            // halves of a console wave reach their meets in the same order; the finished waves'
+            // rounds meet the others' syncs). The other programs' text stays as it was.
+            const AT: &str = "    xcl_xk = k + 1u;\n    if (xcl_xn == 0u) return false;\n";
+            debug_assert!(PRELUDE_X64.contains(AT));
+            if std::env::var("XCL_MESH_BAR_DEBUG").is_ok_and(|v| v.trim() == "2") {
+                // (diagnosis, `PRELUDE_ROUND_BARRIER_DEBUG`: no syncs once aborted)
+                h.push_str("static bool xcl_dbg_off = false;\n");
+                h.push_str(&PRELUDE_X64.replacen(AT, "    xcl_xk = k + 1u;\n    if (!xcl_dbg_off) { GroupMemoryBarrierWithGroupSync(); GroupMemoryBarrierWithGroupSync(); }\n    return xcl_xn != 0u;\n", 1));
+            } else {
+                let x = PRELUDE_X64.replacen(AT, "    xcl_xk = k + 1u;\n    GroupMemoryBarrierWithGroupSync();\n    GroupMemoryBarrierWithGroupSync();\n    return xcl_xn != 0u;\n", 1);
+                h.push_str(&if mesh_trace() { traced(&x) } else { x });
+            }
+        } else if self.opt.mesh_one.is_some() && mesh_plain_poll() {
+            h.push_str(&plain_polls(PRELUDE_X64));
+        } else {
+            h.push_str(PRELUDE_X64);
+        }
     }
 
     /// Storage and functions for early-exit-safe, bounded `s_barrier` (`PRELUDE_SAFE_BARRIER`).
@@ -4973,14 +5097,65 @@ impl Em {
             return;
         }
         let n = self.lds_words();
-        if self.x64_lds() {
+        // (diagnosis: `XCL_MESH_BAR_OWN=1`, a one-pass mesh shader's barrier words in their own variables)
+        let own = self.opt.mesh_one.is_some() && std::env::var("XCL_MESH_BAR_OWN").is_ok_and(|v| v.trim() == "1");
+        if own {
+            h.push_str("groupshared uint xcl_bar_alive_g;\ngroupshared uint xcl_bar_state_g;\n#define XCL_BAR_ALIVE xcl_bar_alive_g\n#define XCL_BAR_STATE xcl_bar_state_g\n");
+            if !self.x64() && self.uses_lds {
+                let _ = writeln!(h, "#define XCL_LDS_TOP {}u", n - 4);
+            }
+        } else if self.x64_lds() {
             let _ = writeln!(h, "#define XCL_BAR_ALIVE xcl_lds[{}u]\n#define XCL_BAR_STATE xcl_lds[{}u]", n - 3, n - 2);
         } else if !self.x64() && self.uses_lds {
             let _ = writeln!(h, "#define XCL_LDS_TOP {}u\n#define XCL_BAR_ALIVE xcl_lds[{}u]\n#define XCL_BAR_STATE xcl_lds[{}u]", n - 4, n - 3, n - 2);
         } else {
             h.push_str("groupshared uint xcl_bar_alive_g;\ngroupshared uint xcl_bar_state_g;\n#define XCL_BAR_ALIVE xcl_bar_alive_g\n#define XCL_BAR_STATE xcl_bar_state_g\n");
         }
-        h.push_str(PRELUDE_SAFE_BARRIER);
+        // (local) `XCL_MESH_ROUND_BARRIER=1`, a one-pass mesh shader: rounds of group syncs with
+        // no early exit (`PRELUDE_ROUND_BARRIER`) instead of the spinning barrier
+        let round = self.opt.mesh_one.is_some() && mesh_round_barrier();
+        if round && std::env::var("XCL_MESH_BAR_DEBUG").is_ok_and(|v| v.trim() == "2") {
+            // (diagnosis: a barrier that waited 256 rounds stores what it read at `io` dword 256 +
+            // 4 · (hardware thread / 32) and raises an abort every wave sees in the same round;
+            // from then on no wave syncs, so the draw ends and the records can be read)
+            h.push_str(PRELUDE_ROUND_BARRIER_DEBUG);
+        } else if round && std::env::var("XCL_MESH_BAR_DEBUG").is_ok_and(|v| v.trim() == "1") {
+            // (diagnosis: a barrier that waited 4,096 rounds stores what it read into `io` dword
+            // 256 + 4 · (its hardware thread / 32): the count, the live waves, its console wave,
+            // its exchanges so far; and leaves)
+            h.push_str("static uint xcl_dbg_gi = 0u;\n");
+            // (the exit loop capped too: dword 256 + 16 + 4 · wave: 0xE0E0, live waves, rounds, exchanges)
+            let exit_capped = PRELUDE_ROUND_BARRIER.replacen(
+                "    [loop] for (;;) {\n        GroupMemoryBarrierWithGroupSync();\n        uint _a = XCL_BAR_ALIVE;\n        GroupMemoryBarrierWithGroupSync();\n        if (_a == 0u) break;",
+                "    [loop] for (uint _r = 0u; ; _r++) {\n        GroupMemoryBarrierWithGroupSync();\n        uint _a = XCL_BAR_ALIVE;\n        GroupMemoryBarrierWithGroupSync();\n        if (_a == 0u) { if (WaveIsFirstLane()) { uint _w = 1088u + 16u * (xcl_dbg_gi / 32u); io.Store(_w, 0xE0E0u); io.Store(_w + 4u, _a); io.Store(_w + 8u, _r); io.Store(_w + 12u, xcl_xk); } break; }",
+                1,
+            );
+            h.push_str(&exit_capped.replacen(
+                "    [loop] for (;;) {\n        GroupMemoryBarrierWithGroupSync();\n        uint _s = XCL_BAR_STATE, _a = XCL_BAR_ALIVE;\n        GroupMemoryBarrierWithGroupSync();\n        if (_s >= _a) {",
+                "    [loop] for (uint _r = 0u; ; _r++) {\n        GroupMemoryBarrierWithGroupSync();\n        uint _s = XCL_BAR_STATE, _a = XCL_BAR_ALIVE;\n        GroupMemoryBarrierWithGroupSync();\n        if (_r >= 4096u) { if (WaveIsFirstLane()) { uint _w = 1024u + 16u * (xcl_dbg_gi / 32u); io.Store(_w, _s); io.Store(_w + 4u, _a); io.Store(_w + 8u, xcl_cw); io.Store(_w + 12u, xcl_xk); } break; }\n        if (_s >= _a) {",
+                1,
+            ));
+        } else if round && std::env::var("XCL_MESH_BAR_COUNT").is_ok_and(|v| v.trim() == "0") {
+            // (diagnosis: the barrier as one round, not counting the waves at it)
+            const COUNTING: &str = "void xcl_s_barrier() {\n    if (WaveIsFirstLane())";
+            let at = PRELUDE_ROUND_BARRIER.find(COUNTING).expect("the counting barrier");
+            let end = at + PRELUDE_ROUND_BARRIER[at..].find("\n}\n").expect("its end") + 3;
+            h.push_str(&format!("{}void xcl_s_barrier() {{\n    GroupMemoryBarrierWithGroupSync();\n    GroupMemoryBarrierWithGroupSync();\n}}\n{}", &PRELUDE_ROUND_BARRIER[..at], &PRELUDE_ROUND_BARRIER[end..]));
+        } else if round && std::env::var("XCL_MESH_BAR_PROBE").is_ok_and(|v| v.trim() == "loop1") {
+            // (diagnosis: the counting loop, left after its first round whatever it read)
+            h.push_str(&PRELUDE_ROUND_BARRIER.replacen("        if (_s >= _a) break;", "        if (_s >= _a || true) break;", 1));
+        } else if round && std::env::var("XCL_MESH_BAR_PROBE").is_ok_and(|v| v.trim() == "noloop") {
+            // (diagnosis: no loop – one read round, as a straight line)
+            h.push_str(&PRELUDE_ROUND_BARRIER.replacen("    [loop] for (;;) {\n", "    {\n", 1).replacen("        if (_s >= _a) break;\n", "", 1));
+        } else if round && mesh_trace() {
+            h.push_str(&traced(PRELUDE_ROUND_BARRIER));
+        } else if round {
+            h.push_str(PRELUDE_ROUND_BARRIER);
+        } else if self.opt.mesh_one.is_some() && mesh_plain_poll() {
+            h.push_str(&plain_polls(PRELUDE_SAFE_BARRIER));
+        } else {
+            h.push_str(PRELUDE_SAFE_BARRIER);
+        }
     }
 
     /// Split wave64, at the start of `main`: the console thread this thread stands for
@@ -5010,7 +5185,15 @@ impl Em {
             // lane reads within a quad see helper lanes (`rla`)
             h.push_str("#define XCL_PIXEL 1\n");
         }
-        h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
+        if self.opt.mesh_one.is_some() {
+            // (local) a one-pass mesh shader: u0 is the pixel shader's `io`, there are no records
+            h.push_str("RWByteAddressBuffer io : register(u1);\n");
+            if mesh_trace() {
+                h.push_str(PRELUDE_MESH_TRACE);
+            }
+        } else {
+            h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
+        }
         // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
         // memory coherent across the GPU only when the program actually uses those; otherwise
@@ -5283,23 +5466,62 @@ static uint xcl_cap = 1u << 16;
                 let native_lanes = if !self.opt.wave64 || self.x64() { 32 } else { 64 };
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
                 if self.uses_lds && !self.x64_lds() {
-                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    // (8192 but in a one-pass mesh shader, `lds_words`)
+                    let _ = writeln!(h, "groupshared uint xcl_lds[{}]; // D3D12 limit: 32 KB (the console allows 64 KB)", self.lds_words());
                 }
                 self.safe_barrier_prelude(&mut h);
                 let t = ms.threads;
-                let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
+                // (local) the mesh group's threads: one console wave's (`mesh_one_wave`)
+                let ht = if self.mesh_one_wave { t.min(64) } else { t };
+                let (mv, mp) = (ms.max_vertices, ms.max_primitives);
+                if let Some(one) = &self.opt.mesh_one {
+                    // (local) one pass: a mesh shader, its outputs written where the program exports
+                    // (no wave size: a GPU with 32-lane waves only, `pso::console_mesh_one`); the counts
+                    // are the maxima, the program's own come from one lane (cool_fox `mesh_prologue`)
+                    h.push_str(&one_pass_vertex(ms, one.ps_inputs.as_deref()).0);
+                    let _ = writeln!(
+                        h,
+                        "[outputtopology(\"triangle\")]\n[numthreads({ht}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{\n    SetMeshOutputCounts({mv}u, {mp}u);"
+                    );
+                    // every primitive culled first (all indices 0): those no thread exports draw
+                    // nothing. Here, by the hardware thread, before the group sets up its storage:
+                    // culled after it by the console thread (`XCL_MESH_PRECULL=late`), the waves'
+                    // waits on that storage did not end (run 189; `gpu_mesh_mode_one_pass_*` and
+                    // `sample_pack_one_pass_mesh_timing`: 560 ms a draw, 8 ms with this). The group
+                    // syncs of the setup order it before the exports (one wave: gi is the slot).
+                    if std::env::var("XCL_MESH_BAR_DEBUG").is_ok_and(|v| matches!(v.trim(), "1" | "2")) {
+                        h.push_str("    xcl_dbg_gi = gi;\n");
+                    }
+                    if mesh_trace() {
+                        let _ = writeln!(h, "    xcl_tr_w = gid.x < 16u ? (gid.x * 4u + gi / 32u) * 64u : 0xFFFFFFFFu;\n    xcl_tr(9u, gid.x); xcl_tr(10u, gi);");
+                    }
+                    if mesh_precull() == "early" {
+                        let _ = writeln!(h, "    for (uint xcl_p = gi; xcl_p < {mp}u; xcl_p += {ht}u)\n        tris[xcl_p] = uint3(0u, 0u, 0u);");
+                    }
+                } else {
+                    let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
+                }
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_init(gi);\n");
                 }
                 if self.x64() {
                     // the console thread's index (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
-                    h.push_str("    gi = xcl_tid;\n");
+                    if self.mesh_one_wave && t > 64 {
+                        // (local) each console wave of the group in turn, its threads gi + 64 · c
+                        let _ = writeln!(h, "    uint xcl_t0 = xcl_tid;\n    [loop] for (uint xcl_c = 0u; xcl_c < {}u; xcl_c++) {{\n    gi = xcl_c * 64u + xcl_t0;", t / 64);
+                    } else {
+                        h.push_str("    gi = xcl_tid;\n");
+                    }
                 } else {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
                 // thread index in the group as the console numbers it: wave · lanes + lane
                 let _ = writeln!(h, "    uint xcl_wave = gi / {lanes}u;\n    uint xcl_slot = xcl_wave * {lanes}u + lane_id;");
+                // (diagnosis: `XCL_MESH_PRECULL=late`, by the console thread; `0`: none)
+                if self.opt.mesh_one.is_some() && mesh_precull() == "late" {
+                    let _ = writeln!(h, "    for (uint xcl_p = xcl_slot; xcl_p < {mp}u; xcl_p += {t}u)\n        tris[xcl_p] = uint3(0u, 0u, 0u);");
+                }
                 let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", ms.record_dwords());
                 let _ = writeln!(h, "    uint xcl_vtx = xcl_rec + {MESH_HEADER}u + xcl_slot * {}u;", ms.vert_dwords());
                 let _ = writeln!(h, "    uint xcl_prm = xcl_rec + {}u + xcl_slot;", MESH_HEADER + ms.max_vertices as usize * ms.vert_dwords());
@@ -5323,6 +5545,9 @@ static uint xcl_cap = 1u << 16;
                 h.push_str(body);
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_exit();\n");
+                }
+                if self.mesh_one_wave && t > 64 {
+                    h.push_str("    }\n");
                 }
                 h.push_str("}\n");
             }
@@ -5742,6 +5967,122 @@ const MESH_OUTPUT_BYTES: u32 = 32768;
 /// here, which can only overestimate.
 fn passthrough_max_vertices(vbytes: u32) -> u32 {
     (MESH_OUTPUT_BYTES / vbytes).min(256) / 32 * 32
+}
+
+/// (local) One-pass mesh shaders wait through group-sync rounds (`PRELUDE_ROUND_BARRIER`), not the
+/// bounded spins: a wave spinning on another wave of its mesh group never saw it arrive (NVIDIA
+/// under vkd3d-proton; every wait ran to its cap, with atomic or plain polls, whichever the code
+/// around it; `gpu_mesh_mode_one_pass_*`). `XCL_MESH_ROUND_BARRIER=0`: the spins, to compare.
+fn mesh_round_barrier() -> bool {
+    std::env::var("XCL_MESH_ROUND_BARRIER").map_or(true, |v| v.trim() != "0")
+}
+
+/// (local) `XCL_MESH_PLAIN_POLL` (default on): a one-pass mesh shader's waits (the safe barrier,
+/// the split form's meet) poll with plain loads after a fence instead of `InterlockedAdd(x, 0)`:
+/// with atomic polls their waits ran to the 2^20-poll cap there or not depending on the code
+/// around them (`gpu_mesh_mode_one_pass_*`; the arrivals are still atomics).
+fn mesh_plain_poll() -> bool {
+    std::env::var("XCL_MESH_PLAIN_POLL").map_or(true, |v| v.trim() != "0")
+}
+
+/// `plain_polls` of a prelude: its polling atomics as fenced plain loads.
+fn plain_polls(prelude: &str) -> String {
+    let polls = [
+        ("InterlockedAdd(XCL_BAR_STATE, 0u, _s);", "GroupMemoryBarrier(); _s = XCL_BAR_STATE;"),
+        ("InterlockedAdd(XCL_BAR_ALIVE, 0u, _alive);", "_alive = XCL_BAR_ALIVE;"),
+        ("InterlockedAdd(XCL_XC(xcl_cw * 2u + (xcl_half ^ 1u)), 0u, c);", "GroupMemoryBarrier(); c = XCL_XC(xcl_cw * 2u + (xcl_half ^ 1u));"),
+    ];
+    let mut s = prelude.to_owned();
+    for (from, to) in polls {
+        s = s.replace(from, to);
+    }
+    s
+}
+
+/// (local, diagnosis) `XCL_MESH_TRACE=1`: before every group sync a one-pass mesh shader's waves
+/// write where they are into the draw's slice of a system-memory buffer (`xcl_trace`, root
+/// parameter 6; byte 64 · (4 · group + hardware wave), groups 0..15, 16 dwords: `MESH_TRACE_WORDS`),
+/// which `bind` dumps when the device is lost (the `io` block's memory is not the CPU's view).
+pub fn mesh_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_MESH_TRACE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A draw's slice of the trace buffer.
+pub const MESH_TRACE_BYTES: usize = 64 * 4 * 16;
+/// The words of a wave's record: 0 where (`BA` barrier | pc, `3E` meet | exchanges, `E0` exit | pc,
+/// `EDEDEDED` done), 2 / 3 the barrier's count / live lanes read, 4 exchanges, 5 live lanes read at
+/// the exit, 6 syncs so far, 7 the console pc of the last sync, 8 lanes active there, 9 group, 10
+/// hardware thread.
+pub const MESH_TRACE_WORDS: usize = 16;
+
+const PRELUDE_MESH_TRACE: &str = r#"
+globallycoherent RWByteAddressBuffer xcl_trace : register(u0, space3);
+static uint xcl_tr_w = 0u;
+static uint xcl_tr_pc = 0u;
+static uint xcl_tr_n = 0u;
+// (groups 0..15 only: a later group finishing must not cover a stalled one's record)
+void xcl_tr(uint k, uint v) { if (xcl_tr_w != 0xFFFFFFFFu && WaveIsFirstLane()) xcl_trace.Store(xcl_tr_w + 4u * k, v); }
+void xcl_sync() {
+    xcl_tr_n++;
+    xcl_tr(6u, xcl_tr_n); xcl_tr(7u, xcl_tr_pc); xcl_tr(8u, WaveActiveCountBits(true));
+    GroupMemoryBarrierWithGroupSync();
+}
+"#;
+
+/// (trace) `prelude` with its group syncs through `xcl_sync` and the round barrier's records.
+fn traced(prelude: &str) -> String {
+    prelude
+        .replace("GroupMemoryBarrierWithGroupSync();", "xcl_sync();")
+        .replace("void xcl_s_barrier() {\n", "void xcl_s_barrier() {\n    xcl_tr(0u, 0xBA000000u | xcl_tr_pc);\n")
+        .replace("        InterlockedAdd(XCL_BAR_ALIVE, 0u, _a);\n", "        InterlockedAdd(XCL_BAR_ALIVE, 0u, _a);\n        xcl_tr(2u, _s); xcl_tr(3u, _a);\n")
+        .replace("void xcl_s_barrier_exit() {\n", "void xcl_s_barrier_exit() {\n    xcl_tr(0u, 0xE0000000u | xcl_tr_pc);\n")
+        .replace("        uint _a = XCL_BAR_ALIVE;\n", "        uint _a = XCL_BAR_ALIVE;\n        xcl_tr(5u, _a);\n")
+        .replace("        if (_a == 0u) break;\n    }\n}", "        if (_a == 0u) break;\n    }\n    xcl_tr(0u, 0xEDEDEDEDu);\n}")
+        .replace("    xcl_xk = k + 1u;\n    xcl_sync();", "    xcl_xk = k + 1u;\n    xcl_tr(0u, 0x3E000000u | k); xcl_tr(4u, k);\n    xcl_sync();")
+}
+
+/// (local) An instruction (lower-case name) that reads or writes the group's LDS (the lane
+/// exchanges `ds_bpermute` / `ds_permute` / `ds_swizzle` do not).
+pub(super) fn lds_op(name: &str) -> bool {
+    name.starts_with("ds_") && !matches!(name, "ds_bpermute_b32" | "ds_permute_b32" | "ds_swizzle_b32" | "ds_nop")
+}
+
+/// (local) Where a one-pass mesh shader culls its primitives first: `early` (default), `late`, `0`.
+fn mesh_precull() -> String {
+    std::env::var("XCL_MESH_PRECULL").map(|v| v.trim().to_owned()).unwrap_or_else(|_| "early".into())
+}
+
+/// (local) The vertex of a one-pass mesh shader (`Options::mesh_one`): its HLSL struct `XclVert`
+/// (SV_Position, then the elements `mesh_passthrough_for` declares for these PS inputs, alike, so
+/// the pair links as the pass-through did) and each element's (record slot that feeds it – None:
+/// none, it is written 0 –, components, component type).
+pub fn one_pass_vertex(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) -> (String, Vec<(Option<usize>, usize, u32)>) {
+    let slots = ranked(&ms.outputs, true);
+    let elems: Vec<(String, &SigElement, Option<usize>)> = match ps_inputs {
+        None => slots.iter().enumerate().map(|(k, e)| (e.semantic(), *e, Some(k))).collect(),
+        Some(ins) => {
+            let mut v: Vec<(String, &SigElement, Option<usize>)> = ranked(ins, false)
+                .into_iter()
+                .map(|e| {
+                    let k = slots.iter().position(|o| o.system_value == 0 && o.name.eq_ignore_ascii_case(&e.name) && o.index == e.index);
+                    (e.semantic(), e, k)
+                })
+                .collect();
+            v.extend(slots.iter().enumerate().filter(|(_, o)| matches!(o.system_value, 2 | 3)).map(|(k, o)| (o.semantic(), *o, Some(k))));
+            v
+        }
+    };
+    let mut decl = String::from("struct XclVert {\n    float4 pos : SV_Position;\n");
+    let mut out = Vec::new();
+    for (k, (sem, e, slot)) in elems.iter().enumerate() {
+        let n = if ps_inputs.is_some() && !matches!(e.system_value, 2 | 3) { 4 } else { out_comps(e) };
+        let ty = if n == 1 { hlsl_type(e).to_string() } else { format!("{}{n}", hlsl_type(e)) };
+        let _ = writeln!(decl, "    {ty} p{k} : {sem};");
+        out.push((*slot, n, e.component_type));
+    }
+    decl.push_str("};\n");
+    (decl, out)
 }
 
 /// Mesh groups the pass-through spends on one record: the record's vertices fit the mesh
@@ -7386,6 +7727,110 @@ uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 pub(crate) fn safe_barrier_wanted() -> bool {
     std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0")
 }
+
+/// (local) `s_barrier` of a one-pass mesh shader (`Options::mesh_one`, `mesh_round_barrier`)
+/// without spins: `PRELUDE_SAFE_BARRIER`'s spin never saw the other waves arrive there (run 189:
+/// every group to the 2^20-poll cap). Every wait is rounds of two group syncs, so every wave is
+/// always at the same round: values are read between a round's syncs and written outside them. No
+/// wave leaves early: a wave at its end (`s_endpgm`, the loop budget) counts itself out of
+/// `XCL_BAR_ALIVE` and joins rounds until no wave is left. An `s_barrier` counts the waves at one
+/// and joins rounds until every live wave is (runs 190-194 hung the GPU when a barrier was one
+/// round, which another console wave's meet let through early). As on the console, a barrier
+/// waits only for the waves that have not ended.
+const PRELUDE_ROUND_BARRIER: &str = r#"
+void xcl_s_barrier_init(uint gi) {
+    if (gi == 0u) { XCL_BAR_ALIVE = 0u; XCL_BAR_STATE = 0u; }
+    GroupMemoryBarrierWithGroupSync();
+    uint _n = WaveActiveCountBits(true);
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR_ALIVE, _n, _o); }
+    GroupMemoryBarrierWithGroupSync();
+}
+// (Counts are of lanes, not waves: a wave whose lanes run a function in parts – diverged, as a
+// PC GPU may run them – counted itself twice with `WaveIsFirstLane`, and the barrier never saw
+// every wave (`MST_DS_PNTri_c1b6bb00` hung).)
+// A barrier waits for every live wave to be at one (`XCL_BAR_STATE`: the waves there): a meet's
+// syncs are group syncs too, and must not let a wave through its barrier while another console
+// wave is still short of one (run 194: hangs, the data of the waves let through too early). The
+// count is read between a round's syncs and written outside them; when all are there, every one
+// of them sees it in the same round, takes itself off, and one more round orders that before the
+// next arrival (no other wave can arrive meanwhile: all live ones are here).
+void xcl_s_barrier() {
+    uint _n = WaveActiveCountBits(true);
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR_STATE, _n, _o); }
+    [loop] for (;;) {
+        GroupMemoryBarrierWithGroupSync();
+        // (atomic reads: plain ones may be moved past the sync below, then waves disagree)
+        uint _s, _a;
+        InterlockedAdd(XCL_BAR_STATE, 0u, _s);
+        InterlockedAdd(XCL_BAR_ALIVE, 0u, _a);
+        GroupMemoryBarrierWithGroupSync();
+        if (_s >= _a) break;
+    }
+    // (no sync under a condition: the structurizer may move one there)
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR_STATE, 0u - _n, _o); }
+    GroupMemoryBarrierWithGroupSync();
+    GroupMemoryBarrierWithGroupSync();
+}
+void xcl_s_barrier_exit() {
+    uint _n = WaveActiveCountBits(true);
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR_ALIVE, 0u - _n, _o); }
+    [loop] for (;;) {
+        GroupMemoryBarrierWithGroupSync();
+        uint _a = XCL_BAR_ALIVE;
+        GroupMemoryBarrierWithGroupSync();
+        if (_a == 0u) break;
+    }
+}
+"#;
+
+/// (local, `XCL_MESH_BAR_DEBUG=2`) `PRELUDE_ROUND_BARRIER` with an abort (see its use).
+const PRELUDE_ROUND_BARRIER_DEBUG: &str = r#"
+static uint xcl_dbg_gi = 0u;
+groupshared uint xcl_dbg_abort;
+void xcl_s_barrier_init(uint gi) {
+    if (gi == 0u) { XCL_BAR_ALIVE = 0u; XCL_BAR_STATE = 0u; xcl_dbg_abort = 0u; }
+    GroupMemoryBarrierWithGroupSync();
+    uint _n = WaveActiveCountBits(true);
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR_ALIVE, _n, _o); }
+    GroupMemoryBarrierWithGroupSync();
+}
+void xcl_s_barrier() {
+    if (xcl_dbg_off) return;
+    uint _n = WaveActiveCountBits(true);
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR_STATE, _n, _o); }
+    [loop] for (uint _r = 0u; ; _r++) {
+        GroupMemoryBarrierWithGroupSync();
+        uint _s, _a, _ab;
+        InterlockedAdd(XCL_BAR_STATE, 0u, _s);
+        InterlockedAdd(XCL_BAR_ALIVE, 0u, _a);
+        InterlockedAdd(xcl_dbg_abort, 0u, _ab);
+        GroupMemoryBarrierWithGroupSync();
+        if (_ab != 0u) { xcl_dbg_off = true; return; }
+        if (_s >= _a) break;
+        if (_r == 256u && WaveIsFirstLane()) {
+            uint _w = 1024u + 16u * (xcl_dbg_gi / 32u);
+            io.Store(_w, _s); io.Store(_w + 4u, _a); io.Store(_w + 8u, _n | (xcl_cw << 8)); io.Store(_w + 12u, xcl_xk);
+            uint _o; InterlockedOr(xcl_dbg_abort, 1u, _o);
+        }
+    }
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR_STATE, 0u - _n, _o); }
+    GroupMemoryBarrierWithGroupSync();
+    GroupMemoryBarrierWithGroupSync();
+}
+void xcl_s_barrier_exit() {
+    uint _n = WaveActiveCountBits(true);
+    if (WaveIsFirstLane()) { uint _w = 1088u + 16u * (xcl_dbg_gi / 32u); io.Store(_w, 0xE0E00000u | _n); io.Store(_w + 4u, XCL_BAR_ALIVE); io.Store(_w + 8u, xcl_cw); io.Store(_w + 12u, xcl_xk); }
+    if (xcl_dbg_off) return;
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR_ALIVE, 0u - _n, _o); }
+    [loop] for (;;) {
+        GroupMemoryBarrierWithGroupSync();
+        uint _a = XCL_BAR_ALIVE, _ab = xcl_dbg_abort;
+        GroupMemoryBarrierWithGroupSync();
+        if (_ab != 0u) { xcl_dbg_off = true; return; }
+        if (_a == 0u) break;
+    }
+}
+"#;
 
 /// Early-exit-safe, bounded workgroup barrier for multi-warp Compute / Mesh `s_barrier`.
 ///

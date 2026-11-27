@@ -206,6 +206,8 @@ pub fn with_heaps(l: &Layout, user_sgprs: Option<u32>, mut sgprs: Vec<u32>, heap
     sgprs
 }
 
+/// `user_data` of a mesh shader's pass: its user SGPRs (the table's address in s8 / s9, the
+/// inline arguments after).
 pub fn user_data_ms(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     let mut s = vec![0u32; FIRST_SGPR_MS];
     s[8] = table_at as u32;

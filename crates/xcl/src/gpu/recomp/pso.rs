@@ -1318,6 +1318,165 @@ fn console_mesh_with(
 
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
+/// (local; native mesh shaders, stage 1 – nothing calls it yet) Why a console mesh program cannot
+/// run as one D3D12 mesh shader pass instead of XCL's two passes; None: it can. After the VIctory
+/// family's one-pass mesh translation (https://github.com/avatarmanz/VIctory-7900XTX, a9400a6,
+/// crates/victory-shader/src/emit/lower.rs `mesh_prologue`; GPL-3.0-or-later), with XCL's own
+/// limits:
+/// - XCL's lanes are a wave's (masks are ballots): a wave64 program needs a GPU with 32-lane waves
+///   only (the split form) – a D3D12 MS has no wave size to ask for;
+/// - one record per mesh group: the D3D12 output limit of 32 KB (`passthrough_split` 1);
+/// - its LDS and the split form's exchange words within an MS's 28 KB; not known: refused;
+/// - every lane reaches its barriers, at most 128 threads.
+pub fn one_pass_refusal(ms: &super::MsInterface, ps_elements: usize, wave64: bool, wave32_only_gpu: bool, lds_bytes: Option<u32>, exchange_bytes: u32, non_uniform_barrier: bool) -> Option<&'static str> {
+    const MS_LDS: u32 = 28 << 10;
+    if wave64 && !wave32_only_gpu {
+        return Some("a wave64 program on a GPU with 64-lane waves (an MS has no wave size)");
+    }
+    if ms.threads > 128 {
+        return Some("more than 128 threads");
+    }
+    if super::emit::passthrough_split(ms, ps_elements) != 1 {
+        return Some("its record needs more than one mesh group (32 KB of outputs)");
+    }
+    match lds_bytes {
+        None => return Some("its LDS size is not known"),
+        Some(l) if l.saturating_add(exchange_bytes) > MS_LDS => return Some("LDS over 28 KB"),
+        _ => {}
+    }
+    if non_uniform_barrier {
+        return Some("a barrier not every lane reaches");
+    }
+    None
+}
+
+/// (local) The LDS a console program allocates, in bytes: its stage record's +0x4c (the VIctory
+/// family's `native.rs` `RECORD_LDS`, https://github.com/DoubleGhosty/cool_fox by codec_d, f4b48ad;
+/// GPL-3.0-or-later), which is the stage descriptor XCL finds (`xbox::HwStage::offset`: the
+/// record + 0x40, COMPUTE_PGM_RSRC2 being descriptor + 0x38 here and record + 0x78 there) + 0x0c.
+/// 0: not there, or not a plausible size.
+pub fn stage_lds_bytes(f: &xbox::Fssm) -> u32 {
+    let Some(d) = f.stages.first().map(|s| s.offset) else { return 0 };
+    let v = f.data.get(d + 0x0c..d + 0x10).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    if v <= 64 << 10 && v % 4 == 0 { v } else { 0 }
+}
+
+/// (local) `XCL_MESH_ONE_PASS=1`: console mesh programs become one D3D12 mesh shader
+/// (`console_mesh_one`) where they can, the others keep the two passes.
+pub fn mesh_one_pass_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_MESH_ONE_PASS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// (local) A console MS container as one mesh shader (ms_6_6 DXIL, `kernel::translate_mesh_one`)
+/// for the pixel shader `ps` (its container), whose `sampler_base` static samplers come first in
+/// the root signature: the DXIL, the mesh shader's static samplers (registers `sampler_base`..)
+/// and the program's interface; or why not (the caller then takes the two passes).
+pub fn console_mesh_one(blob: &[u8], ps: Option<&[u8]>, wave32_only_gpu: bool, sampler_base: u32) -> Result<(Vec<u8>, Vec<StaticSampler>, super::MsInterface), String> {
+    // `XCL_MESH_ONE_PASS_SKIP=<hash>,…`: these programs (`fnv64` of the container) keep two passes
+    // (run 191-193: one program's one-pass draw hung the GPU at the world start)
+    static SKIP: OnceLock<Vec<u64>> = OnceLock::new();
+    let skip = SKIP.get_or_init(|| std::env::var("XCL_MESH_ONE_PASS_SKIP").unwrap_or_default().split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect());
+    if skip.contains(&crate::gpu::shader::fnv64(blob)) {
+        return Err("left in two passes by XCL_MESH_ONE_PASS_SKIP".into());
+    }
+    // XCL's lanes are a wave's: a mesh shader's wave size is the driver's, known only on a GPU
+    // that runs 32-lane waves alone
+    if !wave32_only_gpu {
+        return Err("a GPU that may run a mesh shader in 64-lane waves".into());
+    }
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
+    let Some(Mode::Mesh(ms)) = interface(blob, &sh, f) else { return Err("unknown MS interface (e.g. lines / points)".into()) };
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    // programs with loops keep two passes unless `XCL_MESH_ONE_PASS_LOOPS=1`: three of them hung
+    // the GPU in one pass (runs 191-195: BakeDecorations, terrain), the straight-line ones ran
+    if has_backward_branch(code) && std::env::var("XCL_MESH_ONE_PASS_LOOPS").map_or(true, |v| v.trim() != "1") {
+        return Err("a program with loops (XCL_MESH_ONE_PASS_LOOPS=1: one pass anyway)".into());
+    }
+    let wave64 = super::fssm_wave64(f, code);
+    let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+    let elements = super::emit::passthrough_elements(&ms, ps_inputs.as_deref());
+    let lds = stage_lds_bytes(f);
+    // the split form's exchange words (`Lw::setup_storage`, at most 32 a slot); the translator
+    // checks the exact total, and an LDS it uses with no size known
+    let waves = ms.threads.div_ceil(64);
+    let exchange = if wave64 { 4 * (4 * 32 * waves + 2 * waves + 1) } else { 0 };
+    if let Some(why) = one_pass_refusal(&ms, elements, wave64, wave32_only_gpu, Some(lds), exchange, false) {
+        return Err(why.into());
+    }
+    // the direct translator first; it refuses a barrier some wave may skip (most retail mesh
+    // programs: an early s_endpgm), which the HLSL path's barrier takes. Wave32 programs only:
+    // the split form's exchanges spin, and spins between waves did not end in a mesh shader
+    // (`emit::PRELUDE_ROUND_BARRIER`; the HLSL form meets through group syncs instead)
+    // (`XCL_MESH_TRACE=1`: the HLSL form, which carries the trace)
+    if crate::gpu::dxil::kernel::enabled() && !wave64 && !super::emit::mesh_trace() {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64, mem_windows: mem_windows(), sampler_base };
+        let one = crate::gpu::dxil::kernel::MeshOne { ms: ms.clone(), ps_inputs: ps_inputs.clone(), lds_bytes: lds };
+        if let Ok(k) = crate::gpu::dxil::kernel::translate_mesh_one(code, o, &one, &f.rodata(p)) {
+            crate::gpu::dxil::coverage::record_translated("MS1");
+            return Ok((k.dxil, k.static_samplers, ms));
+        }
+    }
+    // the HLSL form runs a group of several console waves one console wave at a time
+    // (`emit::mesh_one_wave`): an NVIDIA mesh group takes a branch holding a group sync as the
+    // whole group's, so console waves that branch apart around one broke (run 202). Console
+    // waves that share LDS, or a part wave, keep two passes
+    let lanes = if wave64 { 64 } else { 32 };
+    if ms.threads > lanes && (!wave64 || ms.threads % 64 != 0 || uses_lds(code)) {
+        return Err(format!("{} console waves that may branch apart around group syncs (LDS or wave32)", ms.threads.div_ceil(lanes)));
+    }
+    let one = super::MeshOnePass { ps_inputs, lds_bytes: lds };
+    let opt = Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64: true, static_sampler_base: sampler_base, mem_windows: mem_windows(), rodata: f.rodata(p), mesh_one: Some(one), ..Default::default() };
+    let t = translate(code, &opt)?;
+    if !t.complete() {
+        let missing: Vec<&String> = t.unsupported.keys().collect();
+        return Err(format!("incomplete translation, missing: {missing:?}"));
+    }
+    let words = groupshared_words(&t.hlsl);
+    if words > 7168 {
+        return Err(format!("{} B of groupshared memory, over a mesh shader's 28 KB", 4 * words));
+    }
+    let dxil = dxc::compile_cached(&t.hlsl, "main", "ms_6_6")?.0;
+    Ok((dxil, t.static_samplers, ms))
+}
+
+/// (local) Whether `code` branches back (a loop); a program that does not decode counts as one.
+fn has_backward_branch(code: &[u8]) -> bool {
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { return true };
+        if crate::gpu::rdna2::branch_target(&d).is_some_and(|t| t <= d.pc) {
+            return true;
+        }
+        off += d.len;
+    }
+    false
+}
+
+/// (local) Whether `code` reads or writes LDS (`emit::lds_op`); a program that does not decode does.
+fn uses_lds(code: &[u8]) -> bool {
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { return true };
+        if super::emit::lds_op(&d.inst.name.to_ascii_lowercase()) {
+            return true;
+        }
+        off += d.len;
+    }
+    false
+}
+
+/// (local) The dwords of the `groupshared` declarations of translated HLSL (`uint name[n];` or
+/// `uint name;`).
+fn groupshared_words(hlsl: &str) -> usize {
+    hlsl.lines()
+        .filter_map(|l| l.trim_start().strip_prefix("groupshared "))
+        .map(|d| d.split(';').next().unwrap_or("").split_once('[').and_then(|(_, n)| n.trim_end_matches(']').trim().parse().ok()).unwrap_or(1))
+        .sum()
+}
+
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let windows = mem_windows();
     let dir = dxc::cache_dir();
@@ -1551,6 +1710,181 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
         D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(|e| format!("{e}"))?;
         let blob = blob.ok_or("root signature")?;
         dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).map_err(|e| format!("CreateRootSignature: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod one_pass_tests {
+    use super::one_pass_refusal;
+    use crate::gpu::recomp::MsInterface;
+
+    fn ms(threads: u32, max_vertices: u32) -> MsInterface {
+        MsInterface { outputs: Vec::new(), threads, max_vertices, max_primitives: max_vertices }
+    }
+
+    /// Each limit refuses on its own; a small wave32 program with a known small LDS passes.
+    #[test]
+    fn a_mesh_program_runs_in_one_pass_only_within_every_limit() {
+        let small = ms(64, 64);
+        assert_eq!(one_pass_refusal(&small, 2, false, false, Some(4096), 0, false), None);
+        assert_eq!(one_pass_refusal(&small, 2, true, true, Some(4096), 1024, false), None, "wave64 split on a wave32 GPU");
+        assert!(one_pass_refusal(&small, 2, true, false, Some(4096), 0, false).is_some(), "wave64 on a 64-lane GPU");
+        assert!(one_pass_refusal(&ms(256, 64), 2, false, false, Some(0), 0, false).is_some(), "256 threads");
+        assert!(one_pass_refusal(&small, 2, false, false, None, 0, false).is_some(), "LDS not known");
+        assert_eq!(one_pass_refusal(&small, 2, false, false, Some(28 << 10), 0, false), None, "exactly 28 KB");
+        assert!(one_pass_refusal(&small, 2, false, false, Some(28 << 10), 4, false).is_some(), "28 KB + the exchange");
+        assert!(one_pass_refusal(&small, 2, false, false, Some(0), 0, true).is_some(), "a non-uniform barrier");
+        // 256 vertices of 31 elements: 512 B a vertex, more than 32 KB of outputs for one group
+        assert!(one_pass_refusal(&ms(128, 256), 31, false, false, Some(0), 0, false).is_some(), "split over mesh groups");
+    }
+
+    /// A branch to itself or back is a loop; forward branches and straight code are not.
+    #[test]
+    fn a_backward_branch_is_a_loop() {
+        let enc = |n: &str, e: &str, f: &[(&str, u64)], lit: Option<u32>| crate::gpu::rdna2::encode(n, e, f, lit).unwrap();
+        let mov = enc("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None);
+        let end = enc("S_ENDPGM", "ENC_SOPP", &[], None);
+        let fwd = enc("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)], None); // over one dword
+        let back = enc("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFE)], None); // to the mov before it
+        let straight: Vec<u8> = [mov.clone(), fwd, mov.clone(), end.clone()].concat();
+        let looped: Vec<u8> = [mov, back, end].concat();
+        assert!(!super::has_backward_branch(&straight));
+        assert!(super::has_backward_branch(&looped));
+    }
+
+    /// (local, real data: XCL_SAMPLE_RPF = a shader pack) `stage_lds_bytes` (record +0x4c) is the
+    /// LDS COMPUTE_PGM_RSRC2 allocates for the pack's compute programs, which have both; and a
+    /// census of its mesh programs as one-pass mesh shaders (`translate_mesh_one`, split wave64,
+    /// outputs for no pixel shader): how many translate, and why the others do not.
+    #[test]
+    fn sample_pack_stage_lds_and_one_pass_mesh_census() {
+        let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else {
+            println!("XCL_SAMPLE_RPF not set – skipping");
+            return;
+        };
+        let data = std::fs::read(&path).unwrap();
+        let (mut cs_same, mut cs_other, mut cs_none) = (0usize, 0usize, 0usize);
+        let mut why: std::collections::BTreeMap<String, usize> = Default::default();
+        let (mut ms_n, mut ms_ok) = (0usize, 0usize);
+        let mut lds_hist: std::collections::BTreeMap<u32, usize> = Default::default();
+        let limit: usize = std::env::var("XCL_SAMPLE_MS_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        for rec in crate::gpu::pack::scan(&data, 0x40) {
+            let Some(blob) = crate::gpu::pack::inflate(&data, &rec) else { continue };
+            let Some(sh) = super::xbox::parse(&blob) else { continue };
+            if let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)) {
+                if let Some(cs) = crate::gpu::recomp::CsInterface::from_descriptor(&f.data, f.stages[0].offset) {
+                    match (super::stage_lds_bytes(f), cs.lds_bytes) {
+                        (_, 0) => cs_none += 1,
+                        (a, b) if a.div_ceil(512) * 512 == b => cs_same += 1,
+                        (a, b) => {
+                            if cs_other < 5 {
+                                println!("{}: record {a} B, RSRC2 {b} B", rec.name);
+                            }
+                            cs_other += 1
+                        }
+                    }
+                }
+            }
+            let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)) else { continue };
+            if ms_n >= limit {
+                continue;
+            }
+            ms_n += 1;
+            *lds_hist.entry(super::stage_lds_bytes(f)).or_default() += 1;
+            match super::console_mesh_one(&blob, None, true, 0) {
+                Ok(_) => ms_ok += 1,
+                Err(e) => *why.entry(e.lines().next().unwrap_or("").chars().take(90).collect()).or_default() += 1,
+            }
+        }
+        println!("compute programs with an RSRC2 LDS size: {cs_same} agree with the record, {cs_other} do not ({cs_none} allocate none)");
+        println!("mesh programs: {ms_n}, one pass: {ms_ok}; LDS bytes (record): {lds_hist:?}");
+        for (w, n) in &why {
+            println!("  {n:6}  {w}");
+        }
+        assert!(cs_same > 0 && cs_other * 20 <= cs_same, "the record's LDS is not RSRC2's");
+    }
+
+    /// (local, real data: XCL_SAMPLE_RPF; a diagnosis aid) The pack's mesh programs drawn on the
+    /// GPU with zero inputs, in two passes and in one, 1 and `XCL_SAMPLE_MS_GROUPS` (64) groups
+    /// each: the time the extra groups take in each form. A form much slower than the other
+    /// points at a wait that does not end (run 189: one-pass draws of ~550 ms). Programs
+    /// `XCL_SAMPLE_MS_SKIP`.. (`XCL_SAMPLE_MS_LIMIT` of them, 20).
+    #[test]
+    fn sample_pack_one_pass_mesh_timing() {
+        let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else {
+            println!("XCL_SAMPLE_RPF not set – skipping");
+            return;
+        };
+        use crate::gpu::recomp::{dxc, runner};
+        use super::{interface, translate, Mode, Options};
+        if runner::adapter().is_err() || runner::mesh_shaders_supported() != Ok(true) || !runner::split_wave64() {
+            runner::skip_test("no GPU with mesh shaders and 32-lane waves only");
+            return;
+        }
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (skip, limit, groups) = (env("XCL_SAMPLE_MS_SKIP", 0), env("XCL_SAMPLE_MS_LIMIT", 20), env("XCL_SAMPLE_MS_GROUPS", 64) as u32);
+        let data = std::fs::read(&path).unwrap();
+        // `XCL_SAMPLE_MS_HASH` / `XCL_SAMPLE_PS_HASH`: one program (its container's `fnv64`, as
+        // the run logs name it) with its pixel shader
+        let hash = |k: &str| std::env::var(k).ok().and_then(|v| u64::from_str_radix(v.trim(), 16).ok());
+        let (ms_hash, ps_hash) = (hash("XCL_SAMPLE_MS_HASH"), hash("XCL_SAMPLE_PS_HASH"));
+        let records = crate::gpu::pack::scan(&data, 0x40);
+        let ps_blob = ps_hash.and_then(|h| records.iter().filter_map(|r| crate::gpu::pack::inflate(&data, r)).find(|b| crate::gpu::shader::fnv64(b) == h));
+        // (drawn with a PS that reads the position alone: the outputs are the PS's, so it links;
+        // the title's PS writes targets and depth the runner's pipeline does not have)
+        let ps = dxc::compile("float4 main(float4 pos : SV_Position) : SV_Target0 { return float4(1, 0, 0, 1); }", "main", "ps_6_6", &[]).unwrap();
+        let sg = vec![0u32; 128];
+        let mem = vec![0u32; 1024];
+        let mut seen = 0usize;
+        for rec in records.iter() {
+            let Some(blob) = crate::gpu::pack::inflate(&data, rec) else { continue };
+            let Some(sh) = super::xbox::parse(&blob) else { continue };
+            let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)) else { continue };
+            if ms_hash.is_some_and(|h| crate::gpu::shader::fnv64(&blob) != h) {
+                continue;
+            }
+            seen += 1;
+            if seen <= skip {
+                continue;
+            }
+            if seen > skip + limit {
+                break;
+            }
+            if ms_hash.is_some() || std::env::var_os("XCL_SAMPLE_DUMP_DIR").is_some() {
+                let p = f.programs[0];
+                let code = &f.data[p.offset..p.offset + p.len];
+                println!("{}: wave64 {}, record LDS {} B, PS {}", rec.name, super::super::fssm_wave64(f, code), super::stage_lds_bytes(f), ps_blob.is_some());
+                if let (Some(Mode::Mesh(m)), Ok(dir)) = (interface(&blob, &sh, f), std::env::var("XCL_SAMPLE_DUMP_DIR")) {
+                    let ps_inputs = ps_blob.as_ref().map(|b| crate::gpu::dxbc::signatures(b).0);
+                    let opt = Options { mode: Mode::Mesh(m.clone()), wave64: super::super::fssm_wave64(f, code), split_wave64: true, mem_windows: super::mem_windows(), rodata: f.rodata(&p), mesh_one: Some(super::super::MeshOnePass { ps_inputs, lds_bytes: super::stage_lds_bytes(f) }), ..Default::default() };
+                    let t = translate(code, &opt).unwrap();
+                    std::fs::write(format!("{dir}/one-pass-{:016x}.hlsl", crate::gpu::shader::fnv64(&blob)), &t.hlsl).unwrap();
+                    let two = translate(code, &Options { mesh_one: None, ..opt }).unwrap();
+                    std::fs::write(format!("{dir}/two-pass-{:016x}.hlsl", crate::gpu::shader::fnv64(&blob)), &two.hlsl).unwrap();
+                }
+            }
+            let ps_c = ps_blob.as_deref();
+            let (Ok(two), Ok((one, _, ms))) = (super::console_mesh(&blob, ps_c, true), super::console_mesh_one(&blob, ps_c, true, 0)) else {
+                println!("{:5} {}: not both forms", seen, rec.name);
+                continue;
+            };
+            let time = |cs: &[u8], msb: &[u8], split: u32| -> Result<(f64, f64), String> {
+                let t0 = std::time::Instant::now();
+                let (_, rec) = runner::mesh_draw_split(cs, msb, &ps, 1, split, ms.record_dwords(), &sg, &mem, 16, [0.0; 4])?;
+                // (`XCL_MESH_BAR_DEBUG=1`, one pass: what the barriers that gave up read, 4 dwords a wave)
+                if cs.is_empty() && std::env::var_os("XCL_MESH_BAR_DEBUG").is_some() {
+                    println!("  barrier debug (count, live waves, console wave, exchanges) per hardware wave: {:?}", rec.get(256..272).map(|w| w.chunks(4).collect::<Vec<_>>()));
+                    println!("  exit debug (0xE0E0 | lanes, live lanes, console wave, exchanges) per hardware wave: {:x?}", rec.get(272..288).map(|w| w.chunks(4).collect::<Vec<_>>()));
+                }
+                let t1 = std::time::Instant::now();
+                runner::mesh_draw_split(cs, msb, &ps, groups, split, ms.record_dwords(), &sg, &mem, 16, [0.0; 4])?;
+                let t2 = std::time::Instant::now();
+                Ok(((t1 - t0).as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3))
+            };
+            let a = time(&two.cs, &two.ms, two.mesh_groups_per_record);
+            let b = time(&[], &one, 1);
+            println!("{:5} {} ({} threads): two passes {:?} ms, one pass {:?} ms (1 group, {groups} groups)", seen, rec.name, ms.threads, a, b);
+        }
     }
 }
 

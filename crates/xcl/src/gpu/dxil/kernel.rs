@@ -125,6 +125,32 @@ pub fn translate_mesh(code: &[u8], o: KernelOptions, ms: &MsInterface) -> Result
     translate_entry(code, o, Entry::Mesh(ms.clone()), None, None, 0)
 }
 
+/// (local) A mesh-mode (NGG) program as one D3D12 mesh shader, in place of `translate_mesh`'s
+/// compute pass and the pass-through (after the VIctory family's one-pass mesh lowering,
+/// https://github.com/DoubleGhosty/cool_fox by codec_d, commit f4b48ad, crates/victory-shader/src/emit/lower.rs
+/// `mesh_prologue`, `export`, `emit_indices`; GPL-3.0-or-later): the maxima as the output counts
+/// at entry and every primitive culled first, then each thread's exports into its own vertex and
+/// primitive. Its outputs are the pass-through's for the same pixel shader, so the pair links as
+/// before. `io` is u1 (u0 is the pixel shader's).
+#[derive(Debug, Clone)]
+pub struct MeshOne {
+    pub ms: MsInterface,
+    /// the pixel shader's inputs (`dxbc::signatures(ps).0`); None: every output of the program
+    pub ps_inputs: Option<Vec<crate::gpu::dxbc::SigElement>>,
+    /// the LDS the program allocates (its stage record, `recomp::pso::ms_lds_bytes`); 0: none or
+    /// not known (a program that uses LDS is then refused: a mesh shader has 28 KB, not 32)
+    pub lds_bytes: u32,
+}
+
+/// The `MeshOne` mesh shader of `code` (ms_6_6 DXIL), or why not.
+pub fn translate_mesh_one(code: &[u8], o: KernelOptions, one: &MeshOne, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    let hw_wave = if o.wave64 && !o.split { 64 } else { 32 };
+    if one.ms.threads > hw_wave && super::lower::has_non_uniform_barrier(code) {
+        return Err("non-uniform s_barrier in multi-wave mesh shader".into());
+    }
+    translate_entry_with(code, o, Entry::MeshOnePass(one.clone()), None, None, 0, rodata.to_vec())
+}
+
 /// A vertex shader (the recompiler's `Mode::Vertex`; wave-size independent).
 pub fn translate_vertex(code: &[u8], o: KernelOptions, vs: &VsInterface) -> Result<Kernel, String> {
     translate_entry(code, o, Entry::Vertex(vs.clone()), None, None, 0)
@@ -160,6 +186,8 @@ pub enum Entry {
     Kernel,
     Compute(CsInterface),
     Mesh(MsInterface),
+    /// (local) `translate_mesh_one`
+    MeshOnePass(MeshOne),
     Vertex(VsInterface),
     Pixel(PsInterface),
     Geometry(GsInterface),
@@ -295,6 +323,13 @@ fn translate_on_this_thread(
             mesh_init(&mut lw, ms, tid, io);
             [ms.threads, 1, 1]
         }
+        Entry::MeshOnePass(one) => {
+            let (tid, _) = lw.setup_lanes_compute([one.ms.threads, 1, 1], uses_lds);
+            mesh_init(&mut lw, &one.ms, tid, io);
+            let out = lw.mesh_outputs(&one.ms, one.ps_inputs.as_deref());
+            lw.mesh.as_mut().expect("mesh").one = Some(out);
+            [one.ms.threads, 1, 1]
+        }
         Entry::Geometry(g) => {
             let (tid, _) = lw.setup_lanes_compute([64, 1, 1], uses_lds);
             let used: BTreeSet<u64> = cfg.insts.iter().flat_map(|d| {
@@ -403,6 +438,15 @@ fn translate_on_this_thread(
         let runs = compute_gate(&mut lw, &st, leave);
         lw.cond_br(runs, h0, exit);
         first = gate;
+    } else if lw.mesh.as_ref().is_some_and(|m| m.one.is_some()) {
+        // (local) one-pass mesh shader: its output counts and culled primitives before the program
+        // (the entry block stays open for the registers' first values until the end)
+        let pro = lw.block(Some(1));
+        lw.edge(Block(0), pro);
+        lw.s.m.set_block(pro);
+        lw.mesh_prologue()?;
+        lw.br(h0);
+        first = pro;
     } else {
         lw.edge(Block(0), h0);
     }
@@ -584,15 +628,18 @@ impl Lw {
             Entry::Mesh(ms) => Some(ms.clone()),
             _ => None,
         };
+        let one = matches!(entry, Entry::MeshOnePass(_));
         let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
         let split = split && !gfx;
         let stage = match entry {
             Entry::Vertex(_) => Stage::Vertex,
             Entry::Pixel(_) => Stage::Pixel,
+            Entry::MeshOnePass(_) => Stage::Mesh,
             _ => Stage::Compute,
         };
         let mut s = Shader::new(stage, (6, 6));
-        let io = s.raw_uav(0, 0);
+        // (one-pass mesh: u0 is the pixel shader's `io`, the mesh shader's is u1, where the record was)
+        let io = s.raw_uav(if one { 1 } else { 0 }, 0);
         let res = if kernel || ms.is_some() || matches!(entry, Entry::Geometry(_)) { Some(s.raw_uav(1, 0)) } else { None };
         if stage == Stage::Pixel && uses_pops(insts) {
             s.enable_rov();
@@ -691,11 +738,13 @@ impl Lw {
             Entry::Kernel => None,
             Entry::Compute(cs) => Some(cs.threads.iter().product()),
             Entry::Mesh(ms) => Some(ms.threads),
+            Entry::MeshOnePass(m) => Some(m.ms.threads),
             Entry::Geometry(_) => Some(64),
         };
         if let (Some(t), true) = (group_threads, split) {
             lw.waves = t.div_ceil(64).max(1);
         }
+        // PORT-CHECK: HEAD's barrier refusal here and its Spin partner below leave our MeshOnePass out (as the snapshot's code did)
         if let (Some(t), Entry::Compute(_) | Entry::Mesh(_)) = (group_threads, entry) {
             let hw_lanes = if split || !o.wave64 { 32 } else { 64 };
             lw.barrier_waves = Some(t.div_ceil(hw_lanes).max(1));
@@ -724,9 +773,20 @@ impl Lw {
         let fit = match entry {
             Entry::Compute(cs) if cs.lds_bytes > 0 && on => Some(cs.lds_bytes / 4),
             // (a mesh shader has 28 KB of groupshared memory: always fitted)
+            Entry::MeshOnePass(m) if m.lds_bytes > 0 => Some(m.lds_bytes / 4),
             _ => None,
         };
         lw.setup_storage(uses_lds, if split { slot } else { 1 }, fit);
+        if let Entry::MeshOnePass(m) = entry {
+            // what `setup_storage` declared, at most (the split form's exchange words included)
+            let extra = if split { 4 * lw.xslot * lw.waves + 2 * lw.waves + 1 } else { 0 };
+            let words = if uses_lds { fit.map_or(8192, |w| (w.max(1) + extra).min(8192)) } else { extra };
+            if uses_lds && m.lds_bytes == 0 {
+                lw.exchange_error = Some("one-pass mesh shader: the program's LDS size is not known".into());
+            } else if words > 7168 {
+                lw.exchange_error = Some(format!("one-pass mesh shader: {} B of groupshared memory, over 28 KB", 4 * words));
+            }
+        }
         lw
     }
 
@@ -747,6 +807,16 @@ impl Lw {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
             self.s.try_finish_graphics(g.io, info)
+        } else if stage == Stage::Mesh {
+            let o = self.mesh.take().and_then(|m| m.one).ok_or("mesh entry without mesh outputs")?;
+            let info = super::graphics::StageInfo::Mesh {
+                numthreads,
+                max_vertices: o.max_vertices,
+                max_primitives: o.max_primitives,
+                topology: super::graphics::Topology::Triangle,
+                payload_bytes: 0,
+            };
+            self.s.try_finish_graphics(o.io, info)
         } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
             self.s.m.optimize();
             // A single split wave64 meets its other half through group-shared counters its entry
@@ -1207,7 +1277,7 @@ pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::R
     let mut vgpr = HashMap::new();
     vgpr.insert(5, v5);
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
-    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, vok, pok, outputs: ms.outputs.clone() });
+    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, vok, pok, outputs: ms.outputs.clone(), slot, one: None });
 }
 
 /// EXEC at entry: the console wave's threads (static per wave in the split form: no

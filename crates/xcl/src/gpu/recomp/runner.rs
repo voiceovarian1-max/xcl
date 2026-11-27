@@ -1294,7 +1294,9 @@ pub fn mesh_draw(
     mesh_draw_split(cs, ms, ps, groups, 1, record_dwords, sgprs, mem, size, clear)
 }
 
-/// `mesh_draw` with `split` mesh groups per record (`emit::passthrough_split`).
+/// `mesh_draw` with `split` mesh groups per record (`emit::passthrough_split`). (local) An empty
+/// `cs`: `ms` is a one-pass mesh shader (`kernel::translate_mesh_one`, its `io` at u1): no compute
+/// pass; u1 is a copy of `io` in the record buffer, which comes back as the records.
 #[allow(clippy::too_many_arguments)]
 pub fn mesh_draw_split(
     cs: &[u8],
@@ -1310,15 +1312,21 @@ pub fn mesh_draw_split(
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let one_pass = cs.is_empty();
     unsafe {
         let dev = &gpu.dev;
-        let cpso: ID3D12PipelineState = dev
-            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: transmute_copy(&gpu.rs),
-                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as _, BytecodeLength: cs.len() },
-                ..Default::default()
-            })
-            .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+        let cpso: Option<ID3D12PipelineState> = if one_pass {
+            None
+        } else {
+            Some(
+                dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: transmute_copy(&gpu.rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as _, BytecodeLength: cs.len() },
+                    ..Default::default()
+                })
+                .map_err(|x| format!("CreateComputePipelineState: {x}"))?,
+            )
+        };
         let mut blend = D3D12_BLEND_DESC::default();
         blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
         let rast = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() };
@@ -1396,27 +1404,35 @@ pub fn mesh_draw_split(
         let readback = buffer(dev, total + res_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
-        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &cpso).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, cpso.as_ref().unwrap_or(&mpso)).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
         list.CopyBufferRegion(&mem_buf, 0, &upload, io_bytes, mem_bytes);
+        // (one pass: the mesh shader's `io` (u1) is a copy in the record buffer, so what it stores
+        // there comes back as the records)
+        let one_io = one_pass && res_bytes >= io_bytes;
+        if one_io {
+            list.CopyBufferRegion(&res_buf, 0, &upload, 0, io_bytes);
+        }
         list.ResourceBarrier(&[
             transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&res_buf, if one_io { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_COMMON }, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         // pass 1: the console program as a compute shader
         let _bound = bind_resources(dev, &list, &[], &[])?;
-        list.SetComputeRootSignature(&gpu.rs);
-        list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
-        list.Dispatch(groups, 1, 1);
-        list.ResourceBarrier(&[uav_barrier(&res_buf)]);
-        // pass 2: rasterise the records
+        if !one_pass {
+            list.SetComputeRootSignature(&gpu.rs);
+            list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+            list.Dispatch(groups, 1, 1);
+            list.ResourceBarrier(&[uav_barrier(&res_buf)]);
+        }
+        // pass 2: rasterise the records (one pass: the mesh shader reads `io` at u1)
         list.SetPipelineState(&mpso);
         list.SetGraphicsRootSignature(&gpu.rs);
         list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
-        list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+        list.SetGraphicsRootUnorderedAccessView(1, if one_pass && !one_io { io_buf.GetGPUVirtualAddress() } else { res_buf.GetGPUVirtualAddress() });
         list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
         list.OMSetRenderTargets(1, Some(&rtv), false, None);
         list.ClearRenderTargetView(rtv, &clear, None);

@@ -709,11 +709,24 @@ pub struct Options {
     /// not hold the code, so a load at a code address in one of these ranges takes the dwords
     /// from the shader (`CODE_ADDRESS_HI`)
     pub rodata: Vec<(u32, Vec<u32>)>,
+    /// (local) mesh mode as one D3D12 mesh shader (ms_6_6) instead of the compute pass that
+    /// writes records (`pso::console_mesh_one`)
+    pub mesh_one: Option<MeshOnePass>,
+}
+
+/// (local) `Options::mesh_one`: the mesh shader's outputs are what the pixel shader with
+/// `ps_inputs` reads (as `emit::mesh_passthrough_for` declares them; None: every output), its
+/// `io` is u1 (u0 is the pixel shader's), and its LDS is the `lds_bytes` the program allocates
+/// (a mesh shader has 28 KB; 0: not known).
+#[derive(Debug, Clone, Default)]
+pub struct MeshOnePass {
+    pub ps_inputs: Option<Vec<SigElement>>,
+    pub lds_bytes: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, rodata: Vec::new() }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, rodata: Vec::new(), mesh_one: None }
     }
 }
 

@@ -159,6 +159,10 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
+            // (local, `XCL_MESH_TRACE=1`)
+            if crate::gpu::recomp::emit::mesh_trace() {
+                crate::hle::d3d12x::bind::dump_one_pass_traces();
+            }
             dump_threads();
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
