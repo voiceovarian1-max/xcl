@@ -259,8 +259,10 @@ pub struct Lw {
     pub live_exec: Option<(Value, Value)>,
     /// words per half in an exchange
     pub xslot: u32,
-    /// the program's LDS (`xcl_lds`, 8192 dwords) and its last usable dword
+    /// the program's LDS (`xcl_lds`, `lds_words` dwords: a power of two, 8192 at most) and
+    /// its last usable dword
     pub lds: Option<super::ops::GroupShared>,
+    pub lds_words: u32,
     pub lds_top: u32,
     /// DPP write enable of the instruction being lowered
     pub dpp_enable: Option<Value>,

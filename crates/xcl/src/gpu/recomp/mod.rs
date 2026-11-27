@@ -259,13 +259,6 @@ impl GsInterface {
     }
 }
 
-/// `XCL_LDS_FIT` (default on): a compute program's LDS array is as large as its RSRC2 LDS_SIZE
-/// (`CsInterface::lds_bytes`), not always 32 KB. `XCL_LDS_FIT=0`: 32 KB, as before.
-pub fn lds_fit_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_LDS_FIT").map_or(true, |v| v.trim() != "0"))
-}
-
 /// Compute shader with the console's dispatch ABI (see the module docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CsInterface {
@@ -277,7 +270,7 @@ pub struct CsInterface {
     pub tg_size: bool,
     /// thread id VGPRs: 1 (v0), 2 (v0, v1) or 3 (v0..v2)
     pub tid_components: u32,
-    /// the LDS the program allocates (RSRC2 LDS_SIZE, 512-byte granules); 0: not known
+    /// the group's LDS allocation in bytes (COMPUTE_PGM_RSRC2.LDS_SIZE); 0: not known
     pub lds_bytes: u32,
 }
 
@@ -300,7 +293,8 @@ impl CsInterface {
             tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
             tg_size: (r >> 10) & 1 == 1,
             tid_components: ((r >> 11) & 3) + 1,
-            lds_bytes: ((r >> 15) & 0x1ff) * 512,
+            // LDS_SIZE, bits 15..23, in 128-dword (512-byte) units on RDNA
+            lds_bytes: ((r >> 15) & 0x1FF) * 512,
         }
     }
 }

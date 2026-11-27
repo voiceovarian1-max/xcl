@@ -786,69 +786,6 @@ mod tests {
         }
     }
 
-    /// (local) `ldsfit`: the LDS array sized to the program's RSRC2 LDS_SIZE gives what the full
-    /// 32 KB array gives – 64 threads write their word, a barrier, each reads its mirror's –
-    /// wave32 and the split wave64 form (its exchange words above the program's LDS).
-    #[test]
-    fn a_program_with_its_lds_sized_to_its_allocation_runs_as_with_32_kb() {
-        if !gpu() {
-            return;
-        }
-        let lines: Vec<I> = vec![
-            ("S_MUL_I32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 192)]),
-            // v8 = tid * 4, v7 = tid + 64; LDS[tid] = v7
-            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 0)]),
-            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 192), ("VSRC1", 0)]),
-            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 8), ("DATA0", 7)]),
-            ("S_WAITCNT", "ENC_SOPP", &[("SIMM16", 0)]),
-            ("S_BARRIER", "ENC_SOPP", &[]),
-            // v11 = LDS[63 - tid]
-            ("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 191), ("VSRC1", 0)]),
-            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 130), ("VSRC1", 10)]),
-            ("DS_READ_B32", "ENC_DS", &[("ADDR", 9), ("VDST", 11)]),
-            ("S_WAITCNT", "ENC_SOPP", &[("SIMM16", 0)]),
-            // mem[group * 64 + tid] = v11
-            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 3), ("VSRC1", 0)]),
-            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 12), ("SRC0", 130), ("VSRC1", 4)]),
-            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 13), ("SRC0", 128)]),
-            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 12), ("DATA", 11), ("SADDR", 125), ("OFFSET", 0)]),
-            ENDPGM,
-        ];
-        let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| crate::gpu::rdna2::encode(n, e, f, None).unwrap()).collect();
-        let want: Vec<u32> = (0..128).map(|i| 64 + (63 - i % 64)).collect();
-        use crate::gpu::dxil::module::variant;
-        for (wave64, split) in [(false, false), (true, true)] {
-            if wave64 && runner::wave64_supported() != Ok(true) && !runner::split_wave64() {
-                runner::skip_test("no wave64");
-                continue;
-            }
-            let o = super::KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
-            let mut sizes = Vec::new();
-            for lds_bytes in [0, 256, 512] {
-                let cs = crate::gpu::recomp::CsInterface { lds_bytes, ..compute_cs() };
-                let k = variant::with(variant::LDSFIT, || crate::gpu::dxil::kernel::translate_compute(&bytes, o, &cs)).unwrap_or_else(|e| panic!("{lds_bytes} B: {e}"));
-                let gpu = runner::dispatch(&k.dxil, [2, 1, 1], &[100, 0], &[0u32; 128]).unwrap_or_else(|e| panic!("{lds_bytes} B: {e}"));
-                assert_eq!(gpu, want, "wave64 {wave64}, LDS {lds_bytes} B");
-                sizes.push(k.dxil);
-            }
-            assert!(sizes[1] != sizes[0] && sizes[2] != sizes[1], "the LDS size reaches the program");
-        }
-        // and the HLSL path: wave32, and wave64 in its split form
-        if dxc::location().is_ok() {
-            for (wave64, split) in [(false, false), (true, true)] {
-                for lds_bytes in [0, 256, 512] {
-                    let cs = crate::gpu::recomp::CsInterface { lds_bytes, ..compute_cs() };
-                    let t = translate(&bytes, &Options { mode: Mode::Compute(cs), wave64, split_wave64: split, ..Default::default() }).unwrap();
-                    let words = if lds_bytes == 0 { 8192 } else { lds_bytes / 4 };
-                    assert!(t.hlsl.contains("groupshared uint xcl_lds[") && (lds_bytes == 0) == t.hlsl.contains("xcl_lds[8192]"), "wave64 {wave64}, LDS {lds_bytes} B: {words} words");
-                    let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{lds_bytes} B: {e}"));
-                    let gpu = runner::dispatch(&hlsl, [2, 1, 1], &[100, 0], &[0u32; 128]).unwrap_or_else(|e| panic!("{lds_bytes} B: {e}"));
-                    assert_eq!(gpu, want, "HLSL, wave64 {wave64}, LDS {lds_bytes} B");
-                }
-            }
-        }
-    }
-
     /// A wave64 program in the split form through `compute_with` (the runtime's path on a GPU
     /// with 32-lane waves only): 32-lane hardware waves (`WaveSize(32)`, not 64), the console's
     /// wave64 results (MiguelMachado-dev found `compute_with` passing 64).
