@@ -756,19 +756,27 @@ unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTE
             break;
         }
         out.push(rip as usize);
+        // the thread runs again while its stack is walked (`dump_threads`): a stack pointer that
+        // cannot be read any more ends the walk instead of faulting in RtlVirtualUnwind (no stack
+        // lies in the first 64 KiB, which Windows never maps)
+        if ctx.Rsp < 0x10000 || ctx.Rsp % 8 != 0 || !crate::gpu::shader::readable(ctx.Rsp as usize, 8) {
+            break;
+        }
+        let rsp = ctx.Rsp;
         let mut base = 0u64;
         let f = RtlLookupFunctionEntry(rip, &mut base, std::ptr::null_mut());
         if f.is_null() {
             // a leaf function: the return address is at RSP
-            if !crate::gpu::shader::readable(ctx.Rsp as usize, 8) {
-                break;
-            }
             ctx.Rip = (ctx.Rsp as *const u64).read_unaligned();
             ctx.Rsp += 8;
         } else {
             let mut data = std::ptr::null_mut();
             let mut frame = 0u64;
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, rip, f, ctx, &mut data, &mut frame, std::ptr::null_mut());
+        }
+        // each caller's frame lies above its callee's
+        if ctx.Rsp <= rsp {
+            break;
         }
     }
     out
@@ -1100,6 +1108,26 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unwind_stops_at_a_stack_pointer_it_cannot_read() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{RtlCaptureContext, CONTEXT};
+        #[repr(align(16))]
+        struct Aligned(CONTEXT);
+        unsafe {
+            // this thread's own stack: several frames, each caller above its callee
+            let mut c: Aligned = std::mem::zeroed();
+            RtlCaptureContext(&mut c.0);
+            let frames = unwind(&mut c.0, 8);
+            assert!(frames.len() >= 3, "{frames:x?}");
+            // a thread that ran on while its context was taken (run 185): RIP in a function with
+            // unwind data, RSP no longer a stack: one frame, no fault in RtlVirtualUnwind
+            let mut c: Aligned = std::mem::zeroed();
+            c.0.Rip = unwind as usize as u64 + 16;
+            c.0.Rsp = 0x10;
+            assert_eq!(unwind(&mut c.0, 8), vec![unwind as usize + 16]);
+        }
+    }
 
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
