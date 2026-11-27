@@ -11,7 +11,7 @@
 //!   GetResourceSizeBytes, GetResourceBaseAlignmentBytes, GetMipLevelOffsetBytes(plane, mip),
 //!   GetTexelElementOffsetBytes(plane, mip, x, y, slice, sample, bit*), GetTexelCoordinate,
 //!   CopyIntoSubresource(dst, plane, subresource, src, row pitch, slice pitch),
-//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch), then 2 more.
+//!   CopyFromSubresource(dst, plane, subresource, arg4, src, row pitch, slice pitch), then 2 more.
 //! * XG_RESOURCE_LAYOUT (0x1B40): size @0, alignment @8, mips @0x10, planes @0x14, planes
 //!   from 0x18, 0x6C8 bytes each (usage @0, size @8, slice size @0x10, alignment @0x20, bytes
 //!   per element @0x28, first mip in the tail @0x2C, mips in the tail @0x30, then 15 mips of
@@ -694,15 +694,58 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
     S_OK
 }
 
-/// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
-    let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
+/// #9 CopyFromSubresource(dst, plane, sub, _arg4, src, row_pitch, slice_pitch):
+/// the level's place in `src` (the whole tiled resource) → linear rows at `dst` (`row_pitch` apart).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn copy_from(
+    p: *mut c_void,
+    dst: *mut u8,
+    plane: u32,
+    sub: u32,
+    arg4: u32,
+    src: *const u8,
+    row_pitch: u32,
+    slice_pitch: u32,
+) -> HRESULT {
+    let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else {
+        return E_INVALIDARG;
+    };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
+    let pitch = row_pitch as usize;
+    let slice_stride = slice_pitch as usize;
+    let span = if t.depth > 0 {
+        let slice_span = m.height.saturating_sub(1).checked_mul(pitch).and_then(|o| o.checked_add(row));
+        let depth_ok = m.depth <= 1 || slice_span.is_some_and(|s| slice_stride >= s);
+        depth_ok
+            .then(|| {
+                m.depth
+                    .saturating_sub(1)
+                    .checked_mul(slice_stride)
+                    .and_then(|d| slice_span.and_then(|s| d.checked_add(s)))
+            })
+            .flatten()
+    } else {
+        m.height.saturating_sub(1).checked_mul(pitch).and_then(|o| o.checked_add(row))
+    };
+    let dst_ok = pitch >= row && span.is_some_and(|span| crate::gpu::shader::readable(dst as usize, span));
+    if !dst_ok {
+        static BAD: AtomicU32 = AtomicU32::new(0);
+        if BAD.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "xg: CopyFromSubresource invalid span: dst={dst:p} plane={plane} sub={sub} arg4={arg4:#x} src={src:p} row_pitch={row_pitch:#x} slice_pitch={slice_pitch:#x} (row={row:#x}, h={}, depth={}, bpe={}, mode={:#x})",
+                m.height,
+                t.depth,
+                t.bpe,
+                t.mode
+            );
+        }
+        return E_INVALIDARG;
+    }
     if t.depth > 0 {
         let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
         for (n, from) in linear.chunks_exact(row).enumerate() {
-            let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
+            let to = n / m.height * slice_stride + n % m.height * pitch;
             std::ptr::copy_nonoverlapping(from.as_ptr(), dst.add(to), row);
         }
         return S_OK;
@@ -710,7 +753,7 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
     let slice = std::slice::from_raw_parts(src.add(at as usize + k * t.chain.slice_bytes), t.chain.slice_bytes);
     let linear = t.chain.detile_level(slice, i, k);
     for y in 0..m.height {
-        std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * row_pitch as usize), row);
+        std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * pitch), row);
     }
     S_OK
 }
@@ -781,6 +824,103 @@ mod tests {
             let t = Texture::new(&desc(1920, 1080, 1, 1, f, 0)).unwrap();
             assert_eq!(usages_and_bytes(&t), [(1, 4)]);
             assert_eq!((t.size(), t.alignment()), (rgb10a2.size(), rgb10a2.alignment()));
+        }
+    }
+
+    fn desc_3d(width: u64, height: u32, depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
+        let mut d = desc(width, height, depth, mips, format, layout);
+        d[0..4].copy_from_slice(&4u32.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn copy_into_and_copy_from_round_trip() {
+        let d = desc(64, 32, 1, 1, 28, 0x105);
+        let mut comp = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(XGCreateTextureComputer(d.as_ptr(), &mut comp), S_OK);
+            let vt = *(comp as *const *const usize);
+            let get_size: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(*vt.add(3));
+            let into: unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT = std::mem::transmute(*vt.add(8));
+            let from: unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT = std::mem::transmute(*vt.add(9));
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+
+            let size = get_size(comp) as usize;
+            let pitch = 64 * 4 + 16;
+            let src: Vec<u8> = (0..pitch * 32).map(|i: usize| (i.wrapping_mul(37) ^ (i >> 5)) as u8).collect();
+            let mut tiled = vec![0u8; size];
+            let mut dst = vec![0u8; pitch * 32];
+            assert_eq!(into(comp, tiled.as_mut_ptr(), 0, 0, src.as_ptr(), pitch as u32, (pitch * 32) as u32), S_OK);
+            assert_eq!(from(comp, dst.as_mut_ptr(), 0, 0, 0x1234, tiled.as_ptr(), pitch as u32, (pitch * 32) as u32), S_OK);
+            for y in 0..32 {
+                assert_eq!(dst[y * pitch..y * pitch + 64 * 4], src[y * pitch..y * pitch + 64 * 4], "row {y}");
+            }
+            rel(comp);
+        }
+    }
+
+    #[test]
+    fn copy_from_3d_round_trip() {
+        let d = desc_3d(16, 8, 4, 1, 28, 0x105);
+        let mut comp = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(XGCreateTextureComputer(d.as_ptr(), &mut comp), S_OK);
+            let vt = *(comp as *const *const usize);
+            let get_size: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(*vt.add(3));
+            let into: unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT = std::mem::transmute(*vt.add(8));
+            let from: unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT = std::mem::transmute(*vt.add(9));
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+
+            let size = get_size(comp) as usize;
+            let row = 16 * 4;
+            let pitch = row + 16;
+            let slice_pitch = pitch * 8 + 32;
+            let src: Vec<u8> = (0..slice_pitch * 4).map(|i: usize| (i.wrapping_mul(29) ^ (i >> 3)) as u8).collect();
+            let mut tiled = vec![0u8; size];
+            let mut dst = vec![0u8; slice_pitch * 4];
+            assert_eq!(into(comp, tiled.as_mut_ptr(), 0, 0, src.as_ptr(), pitch as u32, slice_pitch as u32), S_OK);
+            assert_eq!(from(comp, dst.as_mut_ptr(), 0, 0, 0, tiled.as_ptr(), pitch as u32, slice_pitch as u32), S_OK);
+            for z in 0..4 {
+                for y in 0..8 {
+                    let off = z * slice_pitch + y * pitch;
+                    assert_eq!(dst[off..off + row], src[off..off + row], "slice {z} row {y}");
+                }
+            }
+            rel(comp);
+        }
+    }
+
+    #[test]
+    fn copy_from_rejects_invalid_dst_span() {
+        let d2 = desc(64, 32, 1, 1, 28, 0x105);
+        let d3 = desc_3d(16, 8, 4, 1, 28, 0x105);
+        let mut comp2 = std::ptr::null_mut();
+        let mut comp3 = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(XGCreateTextureComputer(d2.as_ptr(), &mut comp2), S_OK);
+            assert_eq!(XGCreateTextureComputer(d3.as_ptr(), &mut comp3), S_OK);
+            let vt = *(comp2 as *const *const usize);
+            let get_size: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(*vt.add(3));
+            let from: unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT = std::mem::transmute(*vt.add(9));
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+
+            let tiled2 = vec![0u8; get_size(comp2) as usize];
+            let mut dst2 = vec![0u8; 64 * 4 * 32];
+            // row_pitch smaller than row width (256 B)
+            assert_eq!(from(comp2, dst2.as_mut_ptr(), 0, 0, 0, tiled2.as_ptr(), 64, 0), E_INVALIDARG);
+            // implausibly huge row_pitch (e.g. a shifted pointer's low 32 bits)
+            assert_eq!(from(comp2, dst2.as_mut_ptr(), 0, 0, 0, tiled2.as_ptr(), 0x4000_0000, 0), E_INVALIDARG);
+            // null pointers
+            assert_eq!(from(comp2, std::ptr::null_mut(), 0, 0, 0, tiled2.as_ptr(), 64 * 4, 0), E_INVALIDARG);
+            assert_eq!(from(comp2, dst2.as_mut_ptr(), 0, 0, 0, std::ptr::null(), 64 * 4, 0), E_INVALIDARG);
+
+            // 3D: slice_pitch smaller than one slice when depth > 1
+            let tiled3 = vec![0u8; get_size(comp3) as usize];
+            let mut dst3 = vec![0u8; 16 * 4 * 8 * 4];
+            assert_eq!(from(comp3, dst3.as_mut_ptr(), 0, 0, 0, tiled3.as_ptr(), 16 * 4, 16 * 4), E_INVALIDARG);
+
+            rel(comp2);
+            rel(comp3);
         }
     }
 }

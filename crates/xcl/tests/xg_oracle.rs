@@ -400,9 +400,10 @@ fn subresource_copies_match_the_console_library() {
                     assert_eq!(into(c)(c, a.as_mut_ptr(), 0, sub, lin.as_ptr(), pitch as u32, (pitch * l.height) as u32), 0);
                     assert_eq!(into(o)(o, b.as_mut_ptr(), 0, sub, lin.as_ptr(), pitch as u32, (pitch * l.height) as u32), 0);
                     // ours reads the console's bytes back
-                    let from: Copy = std::mem::transmute(*(*(o as *const *const usize)).add(9));
+                    type CopyFrom = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u8, u32, u32, u32, *const u8, u32, u32) -> i32;
+                    let from: CopyFrom = std::mem::transmute(*(*(o as *const *const usize)).add(9));
                     let mut back = vec![0u8; pitch * l.height];
-                    assert_eq!(from(o, back.as_mut_ptr(), 0, sub, a.as_ptr(), pitch as u32, 0), 0);
+                    assert_eq!(from(o, back.as_mut_ptr(), 0, sub, 0, a.as_ptr(), pitch as u32, 0), 0);
                     for y in 0..l.height {
                         assert_eq!(back[y * pitch..y * pitch + row], lin[y * pitch..y * pitch + row], "layout {layout:#x} format {f} mip {i} slice {s} row {y}");
                     }
