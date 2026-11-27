@@ -1325,6 +1325,21 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
             let hr2 = real::dev_create_command_signature(this, dpc.as_ptr() as usize, 0, riid, &mut companion);
             if hr2 >= 0 && !companion.is_null() {
                 super::bind::note_dispatch_mesh_signature(*ppv as usize, companion as usize, byte_stride, offset);
+                // (local) the same two with the command argument alone. A signature with more
+                // arguments goes through vkd3d-proton's state template (device generated
+                // commands), which on NVIDIA's Linux driver ran a two-pass command's mesh pass
+                // before the compute pass it reads (`bind::tests::gpu_two_pass_indirect_probe`);
+                // one with the command alone is a plain indirect call.
+                let plain = |ty: u32| -> usize {
+                    let arg = [[ty, 0, 0, 0]];
+                    let mut d = [0u8; 24];
+                    d[0..4].copy_from_slice(&12u32.to_le_bytes());
+                    d[4..8].copy_from_slice(&1u32.to_le_bytes());
+                    d[8..16].copy_from_slice(&(arg.as_ptr() as u64).to_le_bytes());
+                    let mut out: *mut c_void = std::ptr::null_mut();
+                    if real::dev_create_command_signature(this, d.as_ptr() as usize, 0, riid, &mut out) >= 0 { out as usize } else { 0 }
+                };
+                super::bind::note_plain_two_pass_signatures(*ppv as usize, plain(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32), plain(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32));
             }
         }
     }

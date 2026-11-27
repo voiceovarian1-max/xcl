@@ -798,6 +798,25 @@ struct DispatchMeshSig {
 
 static DISPATCH_MESH_SIGS: Mutex<Option<HashMap<usize, DispatchMeshSig>>> = Mutex::new(None);
 
+/// (local) title DispatchMesh signature → (Dispatch, DispatchMesh) signatures with the command
+/// argument alone, for the two-pass ExecuteIndirect (`device_x::create_command_signature_x`)
+static PLAIN_TWO_PASS_SIGS: Mutex<Option<HashMap<usize, (usize, usize)>>> = Mutex::new(None);
+
+pub(super) fn note_plain_two_pass_signatures(sig: usize, dispatch: usize, mesh: usize) {
+    if dispatch != 0 && mesh != 0 {
+        PLAIN_TWO_PASS_SIGS.lock().unwrap().get_or_insert_with(HashMap::new).insert(sig, (dispatch, mesh));
+    }
+}
+
+/// `XCL_TWO_PASS_PLAIN=0`: the two-pass ExecuteIndirect uses the title's signature as upstream does.
+fn plain_two_pass_signatures(sig: usize) -> Option<(usize, usize)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_TWO_PASS_PLAIN").map_or(true, |v| v.trim() != "0")) {
+        return None;
+    }
+    PLAIN_TWO_PASS_SIGS.lock().unwrap().as_ref()?.get(&sig).copied()
+}
+
 pub(super) fn note_root_changing_signature(sig: usize) {
     ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
 }
@@ -852,6 +871,34 @@ unsafe fn emit_uav_barrier(list: &ID3D12GraphicsCommandList, res: Option<&ID3D12
     };
     list.ResourceBarrier(&[std::ptr::read(&b)]);
     std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.UAV).pResource);
+}
+
+/// The barrier between two passes of a two-pass ExecuteIndirect: a UAV barrier on the records.
+/// (local) With the title's signatures (`titles`), which vkd3d-proton runs as device generated
+/// commands when they set more than the command, a global aliasing barrier goes with it under
+/// Wine: on NVIDIA's driver a UAV barrier alone (on the records or on all) did not order such
+/// commands – a mesh pass read its records before its compute pass wrote them, or the next
+/// one's – and with it every run was right (`tests::gpu_two_pass_indirect_probe`).
+unsafe fn emit_two_pass_barrier(list: &ID3D12GraphicsCommandList, records: &ID3D12Resource, titles: bool) {
+    if !titles || !crate::util::under_wine() {
+        return emit_uav_barrier(list, Some(records));
+    }
+    let mut b = [
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(Some(records.clone())) }) },
+        },
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER { pResourceBefore: std::mem::ManuallyDrop::new(None), pResourceAfter: std::mem::ManuallyDrop::new(None) }),
+            },
+        },
+    ];
+    list.ResourceBarrier(&[std::ptr::read(&b[0]), std::ptr::read(&b[1])]);
+    std::mem::ManuallyDrop::drop(&mut (*b[0].Anonymous.UAV).pResource);
 }
 
 unsafe fn emit_transition(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
@@ -1055,6 +1102,9 @@ fn open_after(open: Option<u8>, step: TwoPassStep) -> Option<u8> {
 /// `plan` on `list` with the records in `res` at `res_va`: `pass(k, compute, records)` records a
 /// pass with its region at GPU address `records` (the second half `half` bytes in). What each
 /// step leaves a mesh pass reading is kept for the next draw's plan (`State::record_open`).
+/// (local) `titles`: the passes are ExecuteIndirects with the title's signatures
+/// (`emit_two_pass_barrier`).
+#[allow(clippy::too_many_arguments)]
 unsafe fn run_two_pass_plan(
     this: *mut c_void,
     list: &ID3D12GraphicsCommandList,
@@ -1062,11 +1112,12 @@ unsafe fn run_two_pass_plan(
     res: &ID3D12Resource,
     res_va: u64,
     half: u64,
+    titles: bool,
     mut pass: impl FnMut(u32, bool, u64) -> Result<(), String>,
 ) -> Result<(), String> {
     for &step in plan {
         match step {
-            TwoPassStep::Barrier => emit_uav_barrier(list, Some(res)),
+            TwoPassStep::Barrier => emit_two_pass_barrier(list, res, titles),
             TwoPassStep::Pass { k, compute, region } => pass(k, compute, res_va + if region == HALF_1 { half } else { 0 })?,
         }
         with(this, |s| s.record_open = open_after(s.record_open, step));
@@ -1650,6 +1701,13 @@ unsafe fn defer_dispatch_mesh(this: *mut c_void, tp: &Arc<super::real::TwoPassPs
 /// DispatchMesh signature `msig`, its command at UMA address `src`, its count at `count`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn defer_execute_indirect(this: *mut c_void, tp: &Arc<super::real::TwoPassPso>, pso: usize, raw_pso: usize, sig: usize, msig: DispatchMeshSig, max: u32, src: usize, count: Option<usize>) -> bool {
+    // PORT-CHECK: the plain signatures (ours) carried over to HEAD's deferred ExecuteIndirect
+    // (local) the plain signatures, as the one recorded at once takes them; with the title's under
+    // Wine it is recorded at once, where its barriers get the aliasing one (`emit_two_pass_barrier`)
+    let plain = plain_two_pass_signatures(sig);
+    if plain.is_none() && crate::util::under_wine() {
+        return false;
+    }
     let record_bytes = tp.record.record_dwords() as u64 * 4;
     let region = batch_region_bytes(indirect_record_need(record_bytes, tp.mesh_groups_per_record));
     let ty = super::list_x::tracked_list_type(this);
@@ -1667,7 +1725,12 @@ unsafe fn defer_execute_indirect(this: *mut c_void, tp: &Arc<super::real::TwoPas
     let Ok((rewrite, block, at)) = prepare_scaled_args(this, src, count, 1, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap) else { return false };
     // (the block is in INDIRECT_ARGUMENT after the run, `scratch_in_args`)
     let before = scratch_state(with(this, |s| std::mem::replace(&mut s.scratch_in_args, true)));
-    let work = DeferredWork::Indirect { rewrite, block: block.as_raw() as usize, before, companion: msig.companion_dispatch, sig, compute_at: at, mesh_at: at + msig.byte_stride as u64 };
+    // (a plain signature's command is the argument alone, where it is in the command)
+    let (companion, sig, arg) = match plain {
+        Some((dispatch, mesh)) => (dispatch, mesh, msig.mesh_offset as u64),
+        None => (msig.companion_dispatch, sig, 0),
+    };
+    let work = DeferredWork::Indirect { rewrite, block: block.as_raw() as usize, before, companion, sig, compute_at: at + arg, mesh_at: at + msig.byte_stride as u64 + arg };
     push_deferred(this, DeferredDraw { snap: DrawSnap { compute, mesh, work }, _tp: tp.clone(), _mesh_pso: held_pso(pso), _block: Some(block), raw_pso, kind: tp.kind, size: [max, 0, 0] });
     true
 }
@@ -2312,7 +2375,9 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                 }
             }
             let plan = two_pass_plan(1, records, with(this, |s| s.record_open));
-            run_two_pass_plan(this, list, &plan, &res_buf, res_va, cap, |_, compute, va| {
+            // (local) timed as one op: XCL_GPU_PROFILE
+            let t = super::gpu_profile::begin(this, raw_pso, super::gpu_profile::Kind::TwoPass, [n, 0, 0]);
+            let r = run_two_pass_plan(this, list, &plan, &res_buf, res_va, cap, false, |_, compute, va| {
                 bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
                 if compute {
                     list.Dispatch(n, 1, 1);
@@ -2320,7 +2385,9 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                     pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
                 }
                 Ok(())
-            })
+            });
+            super::gpu_profile::end(this, t);
+            r
         })();
         super::gpu_times::after(this);
         match run {
@@ -2475,17 +2542,36 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 };
                 // the groups past the record buffer, and the commands past the count, are dropped
                 // on the GPU (`SCALE_ARGS_HLSL`)
-                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, batch)?;
+                // ((local) through the list's open batch of rewrites when it takes them, `batched_args`)
+                let (scaled, at, batched) = match batched_args(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, Some(tp.mesh_groups_per_record), cap) {
+                    Some((scaled, at)) => (scaled, at, true),
+                    None => {
+                        let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, batch)?;
+                        (scaled, at, false)
+                    }
+                };
                 let plan = two_pass_plan(max, records, with(this, |s| s.record_open));
-                let passes = run_two_pass_plan(this, list, &plan, &res_buf, res_va, region, |k, compute, va| {
+                let plain = plain_two_pass_signatures(sig);
+                // (local) timed as one op: XCL_GPU_PROFILE
+                let t = super::gpu_profile::begin(this, raw_pso, super::gpu_profile::Kind::IndirectTwoPass, [max, 0, 0]);
+                let passes = run_two_pass_plan(this, list, &plan, &res_buf, res_va, region, plain.is_none(), |k, compute, va| {
                     bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
                     let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
-                    pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
+                    let command = first + k as u64 * msig.byte_stride as u64;
+                    match plain {
+                        // (local) the command's arguments alone, where they are in the command
+                        Some((dispatch, mesh)) => pc(this, if compute { dispatch } else { mesh }, 1, scaled.as_raw() as usize, command + msig.mesh_offset as u64, 0, 0),
+                        None => pc(this, s, 1, scaled.as_raw() as usize, command, 0, 0),
+                    }
                     Ok(())
                 });
-                // (with `batch` the block stays in INDIRECT_ARGUMENT for the next rewrite)
-                if !batch {
+                super::gpu_profile::end(this, t);
+                // (with `batch` the block stays in INDIRECT_ARGUMENT for the next rewrite; (local) a
+                // batch's block too)
+                if !batch && !batched {
                     emit_transition(list, &scaled, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+                    // (local) the open batch's block may be this one, now COMMON: the next takes its own
+                    close_arg_batch(this);
                 }
                 passes
             })();
@@ -5837,7 +5923,7 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             for draw in draws {
                 let plan = two_pass_plan(draw.len() as u32, records, with(this, |s| s.record_open));
                 // (the 256 B of records in halves of 128 B: 4 groups at most)
-                run_two_pass_plan(this, &list, &plan, &rec, rec.GetGPUVirtualAddress(), 128, |k, compute, va| {
+                run_two_pass_plan(this, &list, &plan, &rec, rec.GetGPUVirtualAddress(), 128, true, |k, compute, va| {
                     list.SetComputeRootUnorderedAccessView(1, va);
                     list.SetPipelineState(if compute { &pass1 } else { &pass2 });
                     list.ExecuteIndirect(&sig, 1, &indirect, draw[k as usize] * 16, None::<&ID3D12Resource>, 0);
@@ -5858,6 +5944,134 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             }
             indirect.Unmap(0, None);
             out.Unmap(0, None);
+        }
+    }
+
+    /// (local probe) The same on a direct or a compute queue, with the title-like signature
+    /// (constant + dispatch: vkd3d-proton's state template) or a plain one (dispatch only, the
+    /// constant set by the CPU): what each command's mesh pass read, three times each.
+    #[test]
+    fn gpu_two_pass_indirect_probe() {
+        for (name, ty, plain) in [
+            ("compute queue, constant in the signature", D3D12_COMMAND_LIST_TYPE_COMPUTE, false),
+            ("direct queue, constant in the signature", D3D12_COMMAND_LIST_TYPE_DIRECT, false),
+            ("compute queue, plain signature", D3D12_COMMAND_LIST_TYPE_COMPUTE, true),
+            ("direct queue, plain signature", D3D12_COMMAND_LIST_TYPE_DIRECT, true),
+        ] {
+            for _ in 0..3 {
+                println!("PROBE {name}: {:?}", two_pass_indirect_probe(ty, plain));
+            }
+        }
+    }
+
+    fn two_pass_indirect_probe(ty: D3D12_COMMAND_LIST_TYPE, plain: bool) -> Vec<Vec<u32>> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let src = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0), UAV(u1)"
+cbuffer C : register(b0) { uint v; };
+RWByteAddressBuffer rec : register(u0);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void cs(uint3 g : SV_GroupID) { rec.Store(g.x * 4u, v); }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)); }
+"#;
+        // (constant, groups) of each command
+        let commands = [(1u32, 3u32), (2, 2), (3, 4)];
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return Vec::new();
+            }
+            let dev = dev.unwrap();
+            let cs = crate::gpu::recomp::dxc::compile(src, "cs", "cs_6_6", &[]).unwrap();
+            let ms = crate::gpu::recomp::dxc::compile(src, "ms", "cs_6_6", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &cs).unwrap();
+            let pso = |dxil: &[u8]| -> ID3D12PipelineState {
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                };
+                dev.CreateComputePipelineState(&desc).unwrap()
+            };
+            let (pass1, pass2) = (pso(&cs), pso(&ms));
+            let args = [
+                D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                    Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 { Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 { RootParameterIndex: 0, DestOffsetIn32BitValues: 0, Num32BitValuesToSet: 1 } },
+                },
+                D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() },
+            ];
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            if plain {
+                dev.CreateCommandSignature(&D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 16, NumArgumentDescs: 1, pArgumentDescs: args[1..].as_ptr(), NodeMask: 0 }, None::<&ID3D12RootSignature>, &mut sig).unwrap();
+            } else {
+                dev.CreateCommandSignature(&D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 16, NumArgumentDescs: 2, pArgumentDescs: args.as_ptr(), NodeMask: 0 }, &rs, &mut sig).unwrap();
+            }
+            let sig = sig.unwrap();
+            let buffer = |bytes: u64, cpu: bool| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let heap = if cpu {
+                    D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() }
+                } else {
+                    D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let (indirect, rec, out) = (buffer(256, true), buffer(256, false), buffer(1024, true));
+            let map = |b: &ID3D12Resource| -> *mut u32 {
+                let mut p = std::ptr::null_mut();
+                b.Map(0, None, Some(&mut p)).unwrap();
+                p as *mut u32
+            };
+            let (a, o) = (map(&indirect), map(&out));
+            for (k, &(v, x)) in commands.iter().enumerate() {
+                std::ptr::copy_nonoverlapping([v, x, 1, 1].as_ptr(), a.add(4 * k), 4);
+            }
+            std::ptr::write_bytes(o, 0, 256);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, &pass1).unwrap();
+            emit_transition(&list, &indirect, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRootUnorderedAccessView(1, rec.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+            for (k, compute) in two_pass_steps(commands.len() as u32) {
+                list.SetPipelineState(if compute { &pass1 } else { &pass2 });
+                if plain {
+                    list.SetComputeRoot32BitConstant(0, commands[k as usize].0, 0);
+                    list.ExecuteIndirect(&sig, 1, &indirect, k as u64 * 16 + 4, None::<&ID3D12Resource>, 0);
+                } else {
+                    list.ExecuteIndirect(&sig, 1, &indirect, k as u64 * 16, None::<&ID3D12Resource>, 0);
+                }
+                emit_uav_barrier(&list, Some(&rec));
+            }
+            emit_transition(&list, &indirect, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            queue.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 10_000).unwrap();
+            let got: Vec<Vec<u32>> = commands.iter().map(|&(v, x)| (0..x).map(|g| *o.add((v * 16 + g) as usize)).collect()).collect();
+            indirect.Unmap(0, None);
+            out.Unmap(0, None);
+            got
         }
     }
 
