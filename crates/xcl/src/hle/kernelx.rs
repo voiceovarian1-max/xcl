@@ -1020,7 +1020,11 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             // what XCL keeps of the window for itself (readback heaps; its per-draw arguments have
             // a pool of their own)
             const KEEP: usize = 96 << 20;
-            let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
+            // (local) `XCL_COHERENT_KEEP_MB`: more of the window kept back (the mirrors of buffers
+            // outside unified memory go there; a title's heaps took a larger window whole)
+            static KEEP_MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let keep = *KEEP_MB.get_or_init(|| std::env::var("XCL_COHERENT_KEEP_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(KEEP, |mb| mb << 20));
+            let fits = u.size().saturating_sub(u.used()) >= size + keep;
             if let Some(q) = fits.then(|| u.alloc(size, align)).flatten() {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;

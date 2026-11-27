@@ -129,7 +129,9 @@ impl Scatter {
         list.SetComputeRootShaderResourceView(1, ring_va);
         list.SetComputeRootShaderResourceView(2, ring_va + Self::data_at(chunks) as u64);
         list.SetComputeRootUnorderedAccessView(3, to_va);
+        let timed = super::gpu_profile::begin_own(list.as_raw(), super::gpu_profile::OWN_UPLOAD, chunks as u32);
         list.Dispatch(chunks.div_ceil(GROUP) as u32, 1, 1);
+        super::gpu_profile::end(list.as_raw(), timed);
     }
 }
 

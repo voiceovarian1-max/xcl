@@ -193,6 +193,17 @@ impl Nest {
 /// `XCL_DIRECT_COMPACT_NEST`: `auto` or unset nests `>= 512` classes into groups of 32;
 /// `0` / `off` keeps a flat switch; a power of two in `2..=65536` fixes the inner group size.
 pub fn nest_mode() -> Nest {
+    // (local experiment) `XCL_DXIL_VARIANTS` `nestflat` / `nest8` / `nest128`
+    let v = super::module::variant::current();
+    if v & super::module::variant::NESTFLAT != 0 {
+        return Nest::Flat;
+    }
+    if v & super::module::variant::NEST8 != 0 {
+        return Nest::Fixed(8);
+    }
+    if v & super::module::variant::NEST128 != 0 {
+        return Nest::Fixed(128);
+    }
     parse_nest(std::env::var("XCL_DIRECT_COMPACT_NEST").ok().as_deref())
 }
 
@@ -332,13 +343,18 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
         lw.s.m.store(to, next, 4);
         lw.s.m.br(target_latch);
     }
-    if group_size.is_some() {
+    // (local experiment) `XCL_DXIL_VARIANTS` `nest1x` / `unipc`
+    let v = super::module::variant::current();
+    let one_exit = v & super::module::variant::NEST1X != 0;
+    let uniform = v & super::module::variant::UNIPC != 0;
+    if group_size.is_some() && !one_exit {
         // Each group latch performs the loop-exit check rather than forwarding with an empty
         // unconditional branch, so driver CFG simplification preserves the two-level merge fan-in
         // during SSA promotion without adding extra runtime instructions.
         for &gl in &group_latches {
             lw.s.m.set_block(gl);
             let nxt = lw.s.m.load(to, 4);
+            let nxt = if uniform { lw.s.wave_read_lane_first(nxt) } else { nxt };
             let stop = lw.cmpc(Pred::UGe, nxt, n as u32);
             lw.s.m.cond_br(stop, exit, latch);
         }
@@ -346,14 +362,21 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
         lw.init.mem = Some(exit);
         lw.s.m.set_block(latch);
         let next = lw.s.m.load(to, 4);
+        let next = if uniform { lw.s.wave_read_lane_first(next) } else { next };
         lw.s.m.store(at, next, 4);
         lw.br(head);
         lw.seal(head);
     } else {
+        // nest1x: the groups meet in the one latch, which does the exit check
+        for &gl in &group_latches {
+            lw.s.m.set_block(gl);
+            lw.s.m.br(latch);
+        }
         // the epilogue's reads load here
         lw.init.mem = Some(latch);
         lw.s.m.set_block(latch);
         let next = lw.s.m.load(to, 4);
+        let next = if uniform { lw.s.wave_read_lane_first(next) } else { next };
         let stop = lw.cmpc(Pred::UGe, next, n as u32);
         let cont = lw.block(Some(1));
         lw.cond_br(stop, exit, cont);

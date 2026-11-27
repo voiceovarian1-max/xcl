@@ -262,7 +262,11 @@ fn scripted() -> u32 {
     });
     // seconds since the host started, as the log's times (not since the title first polled)
     let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+    // (local) `XCL_PRESS_MS`: how long a press is held (200): a title at 1-2 frames a second reads
+    // the gamepad a few times a second and misses most 200-ms presses
+    static HELD: OnceLock<f64> = OnceLock::new();
+    let held = *HELD.get_or_init(|| std::env::var("XCL_PRESS_MS").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(200.0) / 1000.0);
+    at.iter().filter(|&&(s, _)| t >= s && t < s + held).fold(0, |b, &(_, g)| b | g)
 }
 
 #[link(name = "user32")]
@@ -323,7 +327,40 @@ pub fn poll() -> GamepadState {
             crate::xlog_info!("GameInput: gamepad buttons {new:#x} pressed for the first time");
         }
     }
+    trace_input(&s);
     s
+}
+
+/// `XCL_INPUT_TRACE=1` (diagnostic): one line a second while the title reads the gamepad and anything
+/// is pressed or moved: the readings, the buttons seen in them, how many had a stick moved, the last state.
+fn trace_input(s: &GamepadState) {
+    use std::sync::atomic::AtomicU64;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_INPUT_TRACE").is_ok_and(|v| v.trim() == "1")) {
+        return;
+    }
+    static SINCE: AtomicU64 = AtomicU64::new(0);
+    static READS: AtomicU32 = AtomicU32::new(0);
+    static BUTTONS: AtomicU32 = AtomicU32::new(0);
+    static MOVED: AtomicU32 = AtomicU32::new(0);
+    READS.fetch_add(1, Ordering::Relaxed);
+    BUTTONS.fetch_or(s.buttons, Ordering::Relaxed);
+    if s.left_x != 0.0 || s.left_y != 0.0 || s.right_x != 0.0 || s.right_y != 0.0 || s.left_trigger != 0.0 || s.right_trigger != 0.0 {
+        MOVED.fetch_add(1, Ordering::Relaxed);
+    }
+    let (now, since) = (now_us(), SINCE.load(Ordering::Relaxed));
+    if now - since < 1_000_000 || SINCE.compare_exchange(since, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let (reads, buttons, moved) = (READS.swap(0, Ordering::Relaxed), BUTTONS.swap(0, Ordering::Relaxed), MOVED.swap(0, Ordering::Relaxed));
+    if buttons != 0 || moved != 0 {
+        crate::xlog_info!(
+            "GameInput: input (1 s): {reads} readings, buttons {buttons:#x}, {moved} with a stick or trigger moved; now left ({:.2}, {:.2}) right ({:.2}, {:.2}) triggers ({:.2}, {:.2})",
+            s.left_x, s.left_y, s.right_x, s.right_y, s.left_trigger, s.right_trigger
+        );
+    } else if reads != 0 && now / 1_000_000 % 10 == 0 {
+        crate::xlog_info!("GameInput: input (1 s): {reads} readings, nothing pressed");
+    }
 }
 
 fn now_us() -> u64 {

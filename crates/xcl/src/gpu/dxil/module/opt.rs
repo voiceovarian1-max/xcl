@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use super::{BinOp, Block, CastOp, FnAttrs, Module, Op, Pred, Ty, Value};
+use super::{BinOp, Block, CastOp, ConstDef, FnAttrs, Module, Op, Pred, Ty, Value};
 
 impl Op {
     /// Calls `f` on every value operand.
@@ -107,6 +107,103 @@ impl Module {
     }
 
     /// Cheap algebraic & constant simplification on already-resolved operands.
+    /// Pure ops whose operands may be rewritten under an assumption (math only: no memory,
+    /// no wave ops, whose operands other lanes observe).
+    fn pure_for_fold(&self, op: &Op) -> bool {
+        match op {
+            // (a divisor taken from the other arm may be 0 where the arm was not picked)
+            Op::Bin(BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem, ..) => false,
+            Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) => true,
+            Op::Call(f, args) => {
+                let d = &self.funcs[*f as usize];
+                // derivatives (dx.op 83-86) read the other lanes of the quad
+                let deriv = matches!(args.first(), Some(Value::Const(c)) if matches!(self.consts[*c as usize], ConstDef::Int(_, 83..=86)));
+                !deriv && matches!(d.attrs, FnAttrs::ReadNone) && ["dx.op.unary.", "dx.op.binary.", "dx.op.tertiary."].iter().any(|p| d.name.starts_with(p))
+            }
+            _ => false,
+        }
+    }
+
+    /// Same-mask select folding. The translator writes each lane-masked result as
+    /// `select(lane, new, old)`, so a region's instructions chain selects on one mask.
+    /// `select(c, T, select(c, A, B))` is `select(c, T, B)`; and where `T` is taken `c` holds, so in
+    /// `T`'s pure computation (each instruction used once, by the chain) an operand
+    /// `select(c, A, B)` is `A`. The selects nobody reads then die in DCE.
+    fn fold_same_mask_selects(&mut self, order: &[u32], repl: &[Option<Value>]) -> usize {
+        let mut uses = vec![0u32; self.insts.len()];
+        let mut sels = Vec::new();
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                if repl[i as usize].is_some() {
+                    continue;
+                }
+                self.insts[i as usize].op.for_each_operand(|v| {
+                    if let Value::Inst(j) = v {
+                        uses[j as usize] += 1;
+                    }
+                });
+                if matches!(self.insts[i as usize].op, Op::Select(..)) {
+                    sels.push(i as usize);
+                }
+            }
+        }
+        let sel_of = |m: &Self, v: Value| match v {
+            Value::Inst(j) => match m.insts[j as usize].op {
+                Op::Select(c, t, f) => Some((c, t, f)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut folded = 0;
+        for s in sels {
+            let Op::Select(c, mut t, mut f) = self.insts[s].op else { continue };
+            let (t0, f0) = (t, f);
+            while let Some((c2, _, b)) = sel_of(self, f).filter(|x| x.0 == c) {
+                let _ = c2;
+                f = b;
+            }
+            while let Some((_, a, _)) = sel_of(self, t).filter(|x| x.0 == c) {
+                t = a;
+            }
+            for (old, new) in [(t0, t), (f0, f)] {
+                if old != new {
+                    if let Value::Inst(j) = old { uses[j as usize] -= 1; }
+                    if let Value::Inst(j) = new { uses[j as usize] += 1; }
+                    folded += 1;
+                }
+            }
+            self.insts[s].op = Op::Select(c, t, f);
+            let mut stack = vec![t];
+            let mut seen = 0;
+            while let Some(v) = stack.pop() {
+                seen += 1;
+                if seen > 512 {
+                    break;
+                }
+                let Value::Inst(i) = v else { continue };
+                let i = i as usize;
+                if i == s || repl[i].is_some() || uses[i] != 1 || !self.pure_for_fold(&self.insts[i].op) {
+                    continue;
+                }
+                let mut ops = Vec::new();
+                self.insts[i].op.for_each_operand(|o| ops.push(o));
+                for o in ops {
+                    match sel_of(self, o).filter(|x| x.0 == c) {
+                        Some((_, a, _)) => {
+                            let mut k = 0;
+                            self.insts[i].op.map_operands(|v| if v == o { k += 1; a } else { v });
+                            if let Value::Inst(j) = o { uses[j as usize] -= k; }
+                            if let Value::Inst(j) = a { uses[j as usize] += k; }
+                            folded += 1;
+                        }
+                        None => stack.push(o),
+                    }
+                }
+            }
+        }
+        folded
+    }
+
     fn simplify_op(&mut self, op: &Op, ty: Ty) -> Option<Value> {
         // Keep 64-bit instructions intact so Int64Ops / Doubles shader flags stay consistent.
         if matches!(self.types[ty.0 as usize], super::TypeDef::Int(64) | super::TypeDef::Double) {
@@ -605,6 +702,13 @@ impl Module {
             }
         }
 
+        // (local experiment) same-mask select folding: `selfold` variant or `XCL_DXIL_SELFOLD=1`
+        static SELFOLD_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let selfold = super::variant::current() & super::variant::SELFOLD != 0 || *SELFOLD_ALL.get_or_init(|| std::env::var("XCL_DXIL_SELFOLD").is_ok_and(|v| v.trim() == "1"));
+        if selfold && !skip("selfold") {
+            self.fold_same_mask_selects(&order, &repl);
+        }
+
         // dead instructions: live = side effects, terminators and their operands, transitively
         let (i64t, f64t) = self.existing_i64_f64();
         let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
@@ -632,7 +736,7 @@ impl Module {
             b.retain(|&i| live[i as usize]);
         }
 
-        if !skip("merge") && self.simplify_cfg() {
+        if !skip("merge") && super::variant::current() & super::variant::NOMERGE == 0 && self.simplify_cfg() {
             let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
             let mut repl2: Vec<Option<Value>> = vec![None; self.insts.len()];
             let mut phi_changed = false;
@@ -1193,6 +1297,87 @@ mod tests {
         assert!(order.contains(&latch.0), "the empty latch stays");
         let back: Vec<u32> = order.iter().copied().filter(|&b| m.successors(b as usize).contains(&header)).collect();
         assert_eq!(back, vec![entry.0, latch.0], "one back edge, from the latch");
+    }
+
+    #[test]
+    fn same_mask_selects_fold_to_the_observed_one() {
+        // x1 = sel(m, x0 + 1, x0); x2 = sel(m, x1 * 2, x1): one select stays, x2 = sel(m, (x0 + 1) * 2, x0)
+        fn build() -> (Module, [Value; 4]) {
+            let mut m = Module::new();
+            m.define_entry("main");
+            let i32t = m.i32();
+            let void = m.void();
+            let src_ty = m.func_ty(i32t, &[i32t]);
+            let src = m.declare("dx.op.loadInput.i32", src_ty, FnAttrs::NoUnwind);
+            let sink_ty = m.func_ty(void, &[i32t]);
+            let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+            let z = m.i32c(0);
+            let x0 = m.call(src, &[z]);
+            let one = m.i32c(1);
+            let lim = m.i32c(5);
+            let mask = m.cmp(Pred::ULt, x0, lim);
+            let a1 = m.bin(BinOp::Add, x0, one);
+            let x1 = m.select(mask, a1, x0);
+            let two = m.i32c(2);
+            let a2 = m.bin(BinOp::Mul, x1, two);
+            let x2 = m.select(mask, a2, x1);
+            m.call(sink, &[x2]);
+            m.ret();
+            (m, [mask, x0, a1, x2])
+        }
+        let selects = |m: &Module| m.blocks.iter().flat_map(|b| b.iter()).filter(|&&i| matches!(m.insts[i as usize].op, Op::Select(..))).count();
+        if std::env::var_os("XCL_DXIL_SELFOLD").is_none() {
+            let (mut plain, _) = build();
+            plain.optimize();
+            assert_eq!(selects(&plain), 2, "without the fold both selects stay");
+        }
+        let (mut m, [mask, x0, a1, x2]) = build();
+        super::super::variant::with(super::super::variant::SELFOLD, || m.optimize());
+        assert_eq!(selects(&m), 1);
+        let Value::Inst(x2i) = x2 else { unreachable!() };
+        let Op::Select(c, t, f) = m.insts[x2i as usize].op else { panic!("x2 is a select") };
+        assert_eq!((c, f), (mask, x0));
+        let Value::Inst(ti) = t else { panic!("true arm is an instruction") };
+        assert!(matches!(m.insts[ti as usize].op, Op::Bin(BinOp::Mul, Value::Inst(a), _, _) if Value::Inst(a) == a1));
+    }
+
+    #[test]
+    fn same_mask_fold_keeps_divisors_and_derivative_operands() {
+        // x1 = sel(m, a, x0); q = op(.., x1); x2 = sel(m, q, x1): q keeps x1 (a may be 0 or read by
+        // the other lanes of the quad where m is false)
+        let mut m = Module::new();
+        m.define_entry("main");
+        let i32t = m.i32();
+        let f32t = m.f32();
+        let void = m.void();
+        let src_ty = m.func_ty(i32t, &[i32t]);
+        let src = m.declare("dx.op.loadInput.i32", src_ty, FnAttrs::NoUnwind);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+        let un_ty = m.func_ty(f32t, &[i32t, f32t]);
+        let deriv = m.declare("dx.op.unary.f32", un_ty, FnAttrs::ReadNone);
+        let z = m.i32c(0);
+        let x0 = m.call(src, &[z]);
+        let a = m.call(src, &[z]);
+        let lim = m.i32c(5);
+        let mask = m.cmp(Pred::ULt, x0, lim);
+        let x1 = m.select(mask, a, x0);
+        let k = m.i32c(100);
+        let q = m.bin(BinOp::UDiv, k, x1);
+        let x2 = m.select(mask, q, x1);
+        m.call(sink, &[x2]);
+        let fx1 = m.cast(CastOp::BitCast, x1, f32t);
+        let op83 = m.i32c(83);
+        let d = m.call(deriv, &[op83, fx1]);
+        let di = m.cast(CastOp::BitCast, d, i32t);
+        let x3 = m.select(mask, di, x1);
+        m.call(sink, &[x3]);
+        m.ret();
+        super::super::variant::with(super::super::variant::SELFOLD, || m.optimize());
+        let (Value::Inst(qi), Value::Inst(di)) = (q, d) else { unreachable!() };
+        assert!(matches!(m.insts[qi as usize].op, Op::Bin(BinOp::UDiv, _, v, _) if v == x1), "the divisor stays the select");
+        let Value::Inst(ci) = (match &m.insts[di as usize].op { Op::Call(_, args) => args[1], _ => panic!("d is a call") }) else { panic!("operand is an instruction") };
+        assert!(matches!(m.insts[ci as usize].op, Op::Cast(CastOp::BitCast, v, _) if v == x1), "the derivative's operand stays the select");
     }
 
     #[test]

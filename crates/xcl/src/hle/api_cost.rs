@@ -29,9 +29,19 @@ pub enum Call {
     FenceWait,
     /// copies back landed for the title's look at a fence (`sparse::settle_readbacks_within`)
     FenceSettle,
+    TexturePages,
+    TextureTargets,
+    TextureRegister,
+    WindowMap,
+    WindowUnmap,
+    PageMap,
+    PageUnmap,
+    Readable,
+    ReadbackNow,
+    SettleReadbacks,
 }
 
-pub const CALLS: [(Call, &str); 12] = [
+pub const CALLS: [(Call, &str); 22] = [
     (Call::PlacedTexture, "placed textures"),
     (Call::PlacedBuffer, "placed buffers"),
     (Call::PhysicalPages, "physical page calls"),
@@ -44,6 +54,16 @@ pub const CALLS: [(Call, &str); 12] = [
     (Call::WaitFrameEvent, "WaitFrameEventX"),
     (Call::FenceWait, "blocking fence waits"),
     (Call::FenceSettle, "copies back settled at fence looks"),
+    (Call::TexturePages, "of them: texture pages"),
+    (Call::TextureTargets, "of them: video-memory targets"),
+    (Call::TextureRegister, "of them: kept in step"),
+    (Call::WindowMap, "sparse window maps"),
+    (Call::WindowUnmap, "sparse window unmaps"),
+    (Call::PageMap, "texture page maps"),
+    (Call::PageUnmap, "texture page unmaps"),
+    (Call::Readable, "readable checks outside unified memory"),
+    (Call::ReadbackNow, "CPU reads of GPU-written memory (readback_now)"),
+    (Call::SettleReadbacks, "readback settles"),
 ];
 
 /// calls, microseconds

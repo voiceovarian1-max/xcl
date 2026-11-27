@@ -243,6 +243,7 @@ fn readable_with(p: usize, len: usize, recent: bool) -> bool {
         }
         return ok;
     }
+    let _cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::Readable);
     let ok = readable_asked(p, end);
     if ok && short {
         note_readable(first, last);

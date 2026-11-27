@@ -377,7 +377,11 @@ fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
         Some(c) => println!("  console: imports {}", c.join(", ")),
         None => println!("  WARNING: this is not a valid x64 PE file (encrypted? from an XVC package?)"),
     }
-    let environment = crate::preflight::run(&boot.config.d3d12_adapter);
+    // (local, Linux) `XCL_PREFLIGHT=0`: no check here. The check opens a D3D12 device in this
+    // process, which lives as long as the title: NVIDIA's Linux driver gives every process that
+    // has a device its own shader cache file (the next free one), so the title's process got
+    // another file than `xcl shaders --pipelines` wrote and compiled every big pipeline again.
+    let environment = if std::env::var("XCL_PREFLIGHT").is_ok_and(|v| v.trim() == "0") { Vec::new() } else { crate::preflight::run(&boot.config.d3d12_adapter) };
     crate::preflight::print(&environment);
 
     // the console's CPU is a Zen 2: its titles are compiled for it and fault with an illegal

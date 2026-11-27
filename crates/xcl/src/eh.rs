@@ -62,6 +62,17 @@ pub fn set_title_filter(f: usize) -> usize {
 }
 
 unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+    // (local diagnostic) `XCL_CRASH_HOLD_S=n`: the first unhandled exception waits n seconds before
+    // it is handled – a GPU that hangs loses its device some 20 s later, and what the driver and
+    // vkd3d-proton report then (breadcrumbs) is in the log
+    {
+        static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let n = std::env::var("XCL_CRASH_HOLD_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+        if n != 0 && !HELD.swap(true, Ordering::AcqRel) {
+            crate::xlog_info!("unhandled exception: held for {n} s (XCL_CRASH_HOLD_S)");
+            std::thread::sleep(std::time::Duration::from_secs(n));
+        }
+    }
     crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
         let rec = &*(*info).ExceptionRecord;

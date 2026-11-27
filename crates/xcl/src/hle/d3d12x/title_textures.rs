@@ -386,6 +386,11 @@ impl Table {
             if let Some(mut e) = self.shadowed.remove(&sres) {
                 // (the one that lay over it may have been uploaded over the same video memory)
                 texture_upload::forget(&e.known);
+                // (a pooled texture whose slots went back: another may use them now – no longer
+                // kept in step, never uploaded again)
+                if e.unmapped && super::vram::pool_freed(sres) {
+                    continue;
+                }
                 if e.unmapped {
                     e.unmapped = false;
                     to_remap.push(sres);

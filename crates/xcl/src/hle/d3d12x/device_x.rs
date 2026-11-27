@@ -1145,6 +1145,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                 return hr;
             }
         } else {
+            let _t = crate::hle::api_cost::time(crate::hle::api_cost::Call::TexturePages);
             placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
         }
     }
@@ -1157,7 +1158,11 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
-        match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
+        let registered = {
+            let _t = crate::hle::api_cost::time(crate::hle::api_cost::Call::TextureRegister);
+            super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32))
+        };
+        match registered {
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
                 super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);

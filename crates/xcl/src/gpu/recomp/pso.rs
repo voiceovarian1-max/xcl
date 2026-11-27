@@ -175,6 +175,13 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    // (local experiment) `XCL_DXIL_VARIANTS`: a named program is translated with its variant, uncached
+    let variant = crate::gpu::dxil::module::variant::for_record(crate::gpu::shader::fnv64(blob));
+    if variant != 0 {
+        let r = crate::gpu::dxil::module::variant::with(variant, compile_one).map(|(c, _)| c);
+        crate::xlog_info!("XCL_DXIL_VARIANTS: {:016x} ({stage:?}) translated with variant {variant}: {}", crate::gpu::shader::fnv64(blob), r.as_ref().map_or_else(|e| e.clone(), |c| format!("{} B DXIL", c.dxil.len())));
+        return r;
+    }
     // (the compute shader `XCL_DEBUG_CS_SUB` names: neither the memory nor the disk entry of its
     // bytes, which hold it unchanged – translated again, and the result kept in neither)
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) || cs_subs(blob, stage).is_some() {
@@ -297,7 +304,12 @@ mod translated {
             let id = if crate::gpu::recomp::emit::lds_order_wanted() { id } else { identity_for(&id.to_string(), "xcl-x-lds-order-0") };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
-                identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+                let id = identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")));
+                // (local) `XCL_PER_LANE_SKIP`: another set of outputs
+                match super::per_lane_skip_list().0.as_str() {
+                    "" => id,
+                    skip => identity_for(&id.to_string(), &format!("xcl-per-lane-skip-{skip}")),
+                }
             } else {
                 id
             }
@@ -1065,6 +1077,23 @@ fn takes_code_address(code: &[u8]) -> bool {
     (0..insts.len()).any(|i| insts[i].inst.name == "S_GETPC_B64" && !insts.get(i + 3).is_some_and(|s| s.far_target.is_some()))
 }
 
+/// (local) `XCL_PER_LANE_SKIP=<hash>[,<hash>…]` (`[SHADER]` hashes): these compute programs keep
+/// the per-instruction form with `XCL_PER_LANE=1` (one whose per-lane form does not end on the GPU).
+fn per_lane_skip_list() -> &'static (String, Vec<u64>, bool) {
+    static LIST: OnceLock<(String, Vec<u64>, bool)> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let v = std::env::var("XCL_PER_LANE_SKIP").unwrap_or_default();
+        let list: Vec<u64> = v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect();
+        let wave64_only = std::env::var("XCL_PER_LANE_ONLY").is_ok_and(|o| o.trim() == "wave64");
+        (format!("{}{}", v.trim(), if wave64_only { "+wave64-only" } else { "" }), list, wave64_only)
+    })
+}
+
+fn per_lane_skipped(blob: &[u8]) -> bool {
+    let list = &per_lane_skip_list().1;
+    !list.is_empty() && list.contains(&crate::gpu::shader::fnv64(blob))
+}
+
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
 fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
@@ -1079,7 +1108,10 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
     // (and for a program that reads constant data in its code: the per-lane form has no table)
-    if super::lower_dxil::enabled() && !(!rodata.is_empty() && takes_code_address(code)) {
+    // (local) `XCL_PER_LANE_ONLY=wave64`: the per-lane form for wave64 programs only (what a GPU
+    // with 32-lane waves runs in two halves otherwise); two wave32 programs' per-lane forms did not
+    // end on the GPU in a retail game (`a2325a5828f82784`, `6f2d17214d434d66`)
+    if super::lower_dxil::enabled() && !(!rodata.is_empty() && takes_code_address(code)) && !per_lane_skipped(blob) && (wave64 || !per_lane_skip_list().2) {
         match super::lower_dxil::compute_with(code, &cs, o) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
@@ -1404,7 +1436,7 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
 
 /// The ABI root signature with the pipeline's static samplers (registers 0.., space 1).
 pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
-    abi_signature(dev, graphics, samplers, false)
+    abi_signature(dev, graphics, samplers, false, false)
 }
 
 /// Record all piece dispatches after the six common root views have been bound.
@@ -1452,10 +1484,17 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
 }
 
 pub(crate) fn dispatch_chain_root_signature(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
-    abi_signature(dev, false, samplers, true)
+    abi_signature(dev, false, samplers, true, false)
 }
 
-fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: bool) -> Result<ID3D12RootSignature, String> {
+/// (local, `XCL_MESH_TRACE=1`) The ABI root signature of a traced one-pass mesh pipeline: parameter 6
+/// is u0 space 3, the trace. Its own: changing the shared one made every cached compute pipeline
+/// build again (run 200).
+pub fn abi_root_signature_traced(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
+    abi_signature(dev, true, samplers, false, true)
+}
+
+fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: bool, trace: bool) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
         // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
@@ -1468,6 +1507,14 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             })
             .collect();
+        // (local diagnosis, `abi_root_signature_traced`: parameter 6 = u0 space 3, the one-pass mesh trace)
+        if trace {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1 { ShaderRegister: 0, RegisterSpace: 3, Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         if split {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,

@@ -960,6 +960,17 @@ fn two_pass_mode() -> u8 {
     })
 }
 
+/// (local, to tell them apart on a GPU that hangs) `XCL_TWO_PASS`: `0` skips every two-pass
+/// mesh draw, `direct` skips the ExecuteIndirect ones only. 2: all run, 1: direct only, 0: none.
+fn two_pass_switch() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("XCL_TWO_PASS").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("direct") => 1,
+        _ => 2,
+    })
+}
+
 /// Record regions of a two-pass pass (`TwoPassStep::Pass`): the first half, the second half, or
 /// the whole buffer (both).
 const HALF_0: u8 = 0b01;
@@ -1672,7 +1683,15 @@ fn record_buffer_bytes(need: u64) -> u64 {
 /// Record bytes a two-pass ExecuteIndirect asks for: `INDIRECT_RECORDS`, or less when a command's
 /// groups (at most 65 535 / `split` in X, `record_groups`) need less – the same groups fit.
 fn indirect_record_need(record_bytes: u64, split: u32) -> u64 {
-    INDIRECT_RECORDS.min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
+    indirect_records().min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
+}
+
+/// (local) `XCL_TWO_PASS_RES_MB` (1..=128, read once): `INDIRECT_RECORDS` in MiB (upstream: 32
+/// MiB for each recording that has one; about 100 recordings of a retail title held one each, on
+/// a card that was full already)
+fn indirect_records() -> u64 {
+    static RES_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RES_MB.get_or_init(|| std::env::var("XCL_TWO_PASS_RES_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|m| (1..=128).contains(m)).map_or(INDIRECT_RECORDS, |m| m << 20))
 }
 
 /// The record buffer of this list for `need_bytes` (at most `RECORD_MAX`): buffer, address, bytes.
@@ -2050,6 +2069,12 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     // (XCL_TWO_PASS_BATCH=2: deferred, or the deferred ones recorded before this one)
     if let Some(tp) = &tp {
         if two_pass_defer() && defer_dispatch_mesh(this, tp, pso, raw_pso, [x, y, z]) {
+        // (local) `XCL_TWO_PASS=0`
+        if two_pass_switch() == 0 {
+            mesh_work(this, super::targets::SKIPPED);
+            count(DRAWS_SKIPPED);
+            return;
+        }
             return;
         }
     }
@@ -2191,6 +2216,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             return;
         };
+        // (local) `XCL_TWO_PASS=0` / `direct`
+        if two_pass_switch() < 2 {
+            ei_work(this, sig, super::targets::SKIPPED);
+            count(DRAWS_SKIPPED);
+            return;
+        }
         // (XCL_TWO_PASS_BATCH=2: one command whose arguments and count are in unified memory
         // deferred; anything else as without, after the deferred draws before it)
         if two_pass_defer() && max == 1 && args != 0 {
@@ -3471,7 +3502,8 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     for k in 0..4 {
         views[2 + k] = super::real::uma_window_va(k).filter(|&v| v != 0).unwrap_or(first);
     }
-    let real = real as *mut c_void;
+    // ((local) `XCL_DXIL_AB`: a compute program's variant on odd frames, `real::ab::pick`)
+    let real = if gfx { real } else { super::real::ab::pick(real) } as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?.clone();
     let b = Bound { rs, views, pso: pc, io: views[0] };
     rebind(this, list, &b, gfx);

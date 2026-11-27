@@ -2180,6 +2180,62 @@ static TRANSLATED_COMPUTE: Sharded<()> = Sharded::new();
 /// graphics pipelines built from translated console shaders
 static TRANSLATED_GRAPHICS: Sharded<()> = Sharded::new();
 
+/// (local experiment) `XCL_DXIL_AB=1`: per-program A/B in one run. A compute program named in
+/// `XCL_DXIL_VARIANTS` gets its base pipeline (what the title holds) and its variant's; binds take
+/// the variant on odd frames. The profile shows the variant under the record hash with the top bit
+/// flipped, so both see the same frames' data.
+pub mod ab {
+    use super::*;
+    pub const MARK: u64 = 1 << 63;
+    static ALT: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+    thread_local! {
+        /// the last (resolved, bound) pair on this thread: what `gpu_profile::begin` names
+        static LAST: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    pub(super) unsafe fn build_variant(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void, record: u64, cs: &[u8], riid: *const GUID, base: usize) {
+        use crate::gpu::recomp::pso::{console_to_dxil_for, Stage};
+        let c = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
+            Ok(c) if c.dispatch_chain.is_none() => c,
+            Ok(_) => return crate::xlog_warn!("XCL_DXIL_AB: {record:016x}: the variant is a chain, not built"),
+            Err(e) => return crate::xlog_warn!("XCL_DXIL_AB: {record:016x}: variant translation failed: {e}"),
+        };
+        let mut alt: *mut c_void = std::ptr::null_mut();
+        let (hr, ms, _) = compute_container(this, f, d, rs, &c.dxil, record, riid, &mut alt, ComputeBuild::Whole);
+        if hr < 0 || alt.is_null() {
+            return crate::xlog_warn!("XCL_DXIL_AB: {record:016x}: the variant pipeline was not built ({hr:#x})");
+        }
+        note_pso_rs(alt, rs);
+        if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
+            PSO_USER_SGPRS.insert(alt as usize, (i.user_sgprs, i.threads));
+        }
+        note_translated_compute(hr, &mut alt);
+        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(alt as usize, (record ^ MARK, 0));
+        if super::super::gpu_profile::on() || super::super::gpu_times::enabled() {
+            super::super::gpu_profile::note_compute(record ^ MARK, cs, c.dxil.len(), wave32_only(this));
+        }
+        ALT.lock().unwrap().get_or_insert_with(HashMap::new).insert(base, alt as usize);
+        crate::xlog_info!("XCL_DXIL_AB: {record:016x}: variant pipeline {} B DXIL ({} ms in the driver), profiled as {:016x}", c.dxil.len(), ms.as_millis(), record ^ MARK);
+    }
+
+    /// The pipeline to bind for the resolved `pso`: its variant's on odd frames.
+    pub fn pick(pso: usize) -> usize {
+        if !crate::gpu::dxil::module::variant::ab() {
+            return pso;
+        }
+        let alt = (super::super::present::presents() % 2 == 1).then(|| ALT.lock().unwrap().as_ref().and_then(|m| m.get(&pso).copied())).flatten();
+        let bound = alt.unwrap_or(pso);
+        LAST.with(|l| l.set((pso, bound)));
+        bound
+    }
+
+    /// What `pick` last bound on this thread for the resolved `pso` (`pso` if another).
+    pub fn bound(pso: usize) -> usize {
+        let (r, b) = LAST.with(|l| l.get());
+        if r == pso { b } else { pso }
+    }
+}
+
 /// Whether `pso` is a graphics pipeline of translated console shaders.
 /// `XCL_TRACE_FRAME`: the console VS and PS (their dump names' hashes) of a translated PSO.
 static PSO_SHADERS: Mutex<Option<HashMap<usize, (u64, u64)>>> = Mutex::new(None);
@@ -2887,6 +2943,33 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
     })
 }
 
+/// (local diagnostic) A view by address that makes a new texture: at a new address, or at one
+/// a texture was made for with another desc – which fields of the desc differ (logged with counts).
+fn note_view_miss(va: u64, x: &[u8; 0x38]) {
+    static LAST: Mutex<Option<HashMap<u64, [u8; 0x38]>>> = Mutex::new(None);
+    static COUNTS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let prev = LAST.lock().unwrap().get_or_insert_with(HashMap::new).insert(va, *x);
+    let what = match prev {
+        None => "new address".to_string(),
+        Some(p) => {
+            // (dimension 0, alignment 8, width 0x10, height 0x18, depth 0x1C, mips 0x1E, format 0x20, samples 0x24, layout 0x2C, flags 0x30)
+            let fields = [("dimension", 0, 4), ("alignment", 8, 8), ("width", 0x10, 8), ("height", 0x18, 4), ("depth", 0x1C, 2), ("mips", 0x1E, 2), ("format", 0x20, 4), ("samples", 0x24, 8), ("layout", 0x2C, 4), ("flags", 0x30, 4)];
+            let d: Vec<&str> = fields.iter().filter(|(_, o, n)| p[*o..o + n] != x[*o..o + n]).map(|(f, _, _)| *f).collect();
+            format!("same address, other {}", if d.is_empty() { "bytes".to_string() } else { d.join("+") })
+        }
+    };
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut g = COUNTS.lock().unwrap();
+    let c = g.get_or_insert_with(HashMap::new);
+    *c.entry(what).or_insert(0) += 1;
+    if n.is_power_of_two() && n >= 64 {
+        let mut v: Vec<_> = c.iter().map(|(k, v)| format!("{v} {k}")).collect();
+        v.sort_unstable_by(|a, b| b.split(' ').next().unwrap().parse::<u64>().unwrap_or(0).cmp(&a.split(' ').next().unwrap().parse::<u64>().unwrap_or(0)));
+        crate::xlog_info!("D3D12.X: views by address made {n} textures: {}", v.join(", "));
+    }
+}
+
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
 unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
@@ -2904,6 +2987,7 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
     if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
         return r as *mut c_void;
     }
+    note_view_miss(va, &x);
     let mut r = std::ptr::null_mut();
     // (in COMMON, not the state the title made the memory's buffer in: `depth_uav` keeps that)
     let hr = super::depth_uav::by_address(|| super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r));
@@ -5296,7 +5380,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
-    let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
+    // (local experiment) `XCL_DXIL_AB`: the title's pipeline is the base translation, the variant's is built beside it
+    use crate::gpu::dxil::module::variant;
+    let ab = variant::ab() && variant::for_record(crate::gpu::shader::fnv64(cs)) != 0;
+    let translated = if ab { variant::without(|| console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this))) } else { console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) };
+    let compiled = match translated {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
@@ -5314,6 +5402,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         if n <= 4 || n.is_power_of_two() {
             crate::xlog_warn!("D3D12.X: XCL_SKIP_CS_KB: a compute program of {} KiB of DXIL (record {:016x}) gets no pipeline, its dispatches are skipped ({n} so far)", dxil.len() >> 10, crate::gpu::shader::fnv64(cs));
         }
+        return Some(Err(()));
+    }
+    // (local) `XCL_MAX_CS_DXIL_MB`: the same cut in MiB, as `xcl shaders` makes it (`driver_cache::over_cap`)
+    if driver_cache::over_cap(dxil.len()) {
+        note_translation_error(format!("CS: {} B of DXIL is over XCL_MAX_CS_DXIL_MB – not built", dxil.len()));
         return Some(Err(()));
     }
     // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
@@ -5382,6 +5475,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
     if super::gpu_profile::on() || super::gpu_times::enabled() {
         super::gpu_profile::note_compute(record, cs, dxil.len(), wave32_only(this));
+    }
+    if ab {
+        ab::build_variant(this, f, d, rs, record, cs, riid, *ppv as usize);
     }
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
@@ -5572,6 +5668,13 @@ pub(crate) mod driver_cache {
 
     pub(super) fn stats() -> (u64, u64, u64) {
         (HITS.load(Ordering::Relaxed), STALE.load(Ordering::Relaxed), STORED.load(Ordering::Relaxed))
+    }
+
+    /// Local experiment (not upstream): a compute pipeline whose DXIL is over
+    /// `XCL_MAX_CS_DXIL_MB` is not built – the NVIDIA Vulkan compiler took 10+ GB for a 14 MB one.
+    pub fn over_cap(dxil_len: usize) -> bool {
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        dxil_len > *CAP.get_or_init(|| std::env::var("XCL_MAX_CS_DXIL_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(usize::MAX, |mb| mb << 20))
     }
 
     /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
@@ -8846,8 +8949,11 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "SetPipelineState")));
-    let bound = super::pso_async::resolve(pso as usize);
-    f(this, bound as *mut c_void);
+    let bound = ab::pick(super::pso_async::resolve(pso as usize));
+    {
+        let _pso_guard = UnadoptGuard::new(bound as *mut c_void);
+        f(this, bound as *mut c_void);
+    }
     super::dred::mark_pipeline(this, pso as usize, bound);
     super::list_x::on_set_pipeline_state(this, pso as usize);
 }

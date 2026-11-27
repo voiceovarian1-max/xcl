@@ -231,6 +231,85 @@ enum MdDef {
 
 // --------------------------------------------------------------- module
 
+/// (local experiment) `XCL_DXIL_CONTRACT=1`: see the binop writer.
+fn contract_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DXIL_CONTRACT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// (local experiment) `XCL_DXIL_VARIANTS=contract:h1+h2;fast:h3;nomerge:h4`: named console
+/// programs (record hashes) are translated with one variant each, so one run measures several:
+/// `contract` (float ops may fuse into FMA), `fast` (all fast-math), `nomerge` (no
+/// `simplify_cfg`), `split` (chained pieces even with the split off), `nocompact` (never the
+/// compact form). Their translations skip the caches.
+pub mod variant {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    pub const CONTRACT: u16 = 1;
+    pub const FAST: u16 = 2;
+    pub const NOMERGE: u16 = 4;
+    pub const SPLIT: u16 = 8;
+    pub const NOCOMPACT: u16 = 16;
+    pub const NESTFLAT: u16 = 32;
+    pub const NEST8: u16 = 64;
+    pub const NEST128: u16 = 128;
+    pub const SELFOLD: u16 = 256;
+    /// compact form: the next block index goes through WaveReadLaneFirst at the latches
+    pub const UNIPC: u16 = 512;
+    /// nested compact form: the group latches branch to one latch that does the exit check
+    pub const NEST1X: u16 = 1024;
+    /// the LDS array as large as the program's RSRC2 LDS_SIZE (not always 32 KB)
+    pub const LDSFIT: u16 = 2048;
+    thread_local! {
+        static CUR: Cell<u16> = const { Cell::new(0) };
+        /// `without`: the base translation of a variant program (`XCL_DXIL_AB`)
+        static BASE: Cell<bool> = const { Cell::new(false) };
+    }
+    fn table() -> &'static HashMap<u64, u16> {
+        static T: OnceLock<HashMap<u64, u16>> = OnceLock::new();
+        T.get_or_init(|| {
+            let mut t = HashMap::new();
+            for group in std::env::var("XCL_DXIL_VARIANTS").unwrap_or_default().split(';') {
+                let Some((name, hashes)) = group.split_once(':') else { continue };
+                let bit = match name.trim() { "contract" => CONTRACT, "fast" => FAST, "nomerge" => NOMERGE, "split" => SPLIT, "nocompact" => NOCOMPACT, "nestflat" => NESTFLAT, "nest8" => NEST8, "nest128" => NEST128, "selfold" => SELFOLD, "unipc" => UNIPC, "nest1x" => NEST1X, "ldsfit" => LDSFIT, _ => continue };
+                for h in hashes.split('+').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()) {
+                    *t.entry(h).or_insert(0) |= bit;
+                }
+            }
+            t
+        })
+    }
+    pub fn for_record(h: u64) -> u16 {
+        if BASE.with(|b| b.get()) {
+            return 0;
+        }
+        table().get(&h).copied().unwrap_or(0)
+    }
+    /// `f` with every program translated without its variant
+    pub fn without<R>(f: impl FnOnce() -> R) -> R {
+        let old = BASE.with(|b| b.replace(true));
+        let r = f();
+        BASE.with(|b| b.set(old));
+        r
+    }
+    /// `XCL_DXIL_AB=1`: a variant program gets its base pipeline and its variant's, bound on
+    /// alternate frames and profiled apart (the variant under the record hash with the top bit flipped)
+    pub fn ab() -> bool {
+        static AB: OnceLock<bool> = OnceLock::new();
+        *AB.get_or_init(|| std::env::var("XCL_DXIL_AB").is_ok_and(|v| v.trim() == "1"))
+    }
+    pub fn current() -> u16 {
+        CUR.with(|c| c.get())
+    }
+    pub fn with<R>(v: u16, f: impl FnOnce() -> R) -> R {
+        let old = CUR.with(|c| c.replace(v));
+        let r = f();
+        CUR.with(|c| c.set(old));
+        r
+    }
+}
+
 /// Fast-math flags (LLVM 3.7 bitcode encoding).
 pub mod fmf {
     pub const NONE: u64 = 0;
@@ -1200,8 +1279,21 @@ impl Module {
         match &self.insts[i].op {
             Op::Bin(op, a, b, flags) => {
                 ops.extend_from_slice(&[rel(*a), rel(*b), *op as u64]);
-                if *flags != 0 {
-                    ops.push(*flags);
+                // (local experiment) `XCL_DXIL_CONTRACT=1`: float ops without flags may be
+                // contracted into FMA by the driver (bit 5, allow-contract; no reassociation, NaN
+                // and infinity rules kept)
+                let v = variant::current();
+                let flags = if *flags != 0 || !self.is_float(self.insts[i].ty) {
+                    *flags
+                } else if v & variant::FAST != 0 {
+                    fmf::FAST
+                } else if v & variant::CONTRACT != 0 || contract_all() {
+                    1 << 5
+                } else {
+                    0
+                };
+                if flags != 0 {
+                    ops.push(flags);
                 }
                 w.record(FUNC_CODE_INST_BINOP, ops)
             }

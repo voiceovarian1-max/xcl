@@ -31,7 +31,11 @@ use super::real;
 /// begin / end pairs in flight (a ring): two queries and 16 readback bytes each
 const PAIRS: usize = 1 << 17;
 /// programs a log names
-const TOP: usize = 15;
+/// rows per list (local: `XCL_GPU_PROFILE_TOP`, 1..=200)
+fn top_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_GPU_PROFILE_TOP").ok().and_then(|v| v.trim().parse().ok()).filter(|n| (1..=200).contains(n)).unwrap_or(15))
+}
 const POLL: Duration = Duration::from_millis(100);
 const WINDOW: Duration = Duration::from_secs(2);
 /// windows between two logs of the totals since the start
@@ -53,7 +57,22 @@ pub(super) enum Kind {
     IndirectDraw,
     /// an ExecuteIndirect with a PC pipeline
     PcIndirect,
+    /// (local) GPU work of XCL's own around the title's (`begin_own`): which, in the key
+    Own,
+    /// (local) a two-pass mesh draw: its compute pass, barriers and mesh pass (`bind::dispatch_mesh`)
+    TwoPass,
+    /// (local) an ExecuteIndirect of two-pass mesh draws
+    IndirectTwoPass,
+    /// (local) a one-pass mesh draw (`XCL_MESH_ONE_PASS`), and an ExecuteIndirect of them (its
+    /// argument rewrite included)
+    OnePass,
+    IndirectOnePass,
 }
+
+/// (local) XCL's own GPU work that `begin_own` times.
+pub(super) const OWN_COUNT_CHECK: u64 = 1;
+pub(super) const OWN_UPLOAD: u64 = 2;
+pub(super) const OWN_COPY_BACK: u64 = 3;
 
 impl Kind {
     fn name(self) -> &'static str {
@@ -63,6 +82,11 @@ impl Kind {
             Kind::Draw => "draw",
             Kind::IndirectDraw => "ExecuteIndirect (draws)",
             Kind::PcIndirect => "ExecuteIndirect with a PC pipeline",
+            Kind::Own => "XCL's own",
+            Kind::TwoPass => "two-pass mesh draw (compute pass, barriers, mesh pass)",
+            Kind::IndirectTwoPass => "ExecuteIndirect of two-pass mesh draws",
+            Kind::OnePass => "one-pass mesh draw",
+            Kind::IndirectOnePass => "ExecuteIndirect of one-pass mesh draws (argument rewrite, draws)",
         }
     }
 }
@@ -204,6 +228,10 @@ struct Profile {
     /// pairs taken again before the GPU wrote them, and pairs the GPU wrote out of order
     lost: u64,
     bad: u64,
+    /// (local) the GPU clock at the first begin and the last end of the window's ops (0: none yet)
+    span: (u64, u64),
+    /// (local) the window's ops as (begin, end): their union is the time the GPU ran timed work
+    spans: Vec<(u64, u64)>,
 }
 
 // SAFETY: the readback mapping lives as long as `_buf`; D3D12 objects are free-threaded.
@@ -280,6 +308,8 @@ unsafe fn init(dev: &ID3D12Device) -> Option<Profile> {
         since_start: HashMap::new(),
         lost: 0,
         bad: 0,
+        span: (0, 0),
+        spans: Vec::new(),
     })
 }
 
@@ -348,6 +378,19 @@ pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32
     if !on() || list.is_null() {
         return None;
     }
+    let (a, b) = real::pso_shaders(real::ab::bound(super::pso_async::resolve(pso))).unwrap_or((0, 0));
+    begin_key(list, (kind, a, b), size)
+}
+
+/// (local) Before GPU work of XCL's own on `list` (`what`: `OWN_…`; `n`: how much of it).
+pub(super) unsafe fn begin_own(list: *mut c_void, what: u64, n: u32) -> Option<Pair> {
+    if !on() || list.is_null() {
+        return None;
+    }
+    begin_key(list, (Kind::Own, what, 0), [n, 0, 0])
+}
+
+unsafe fn begin_key(list: *mut c_void, key: Key, size: [u32; 3]) -> Option<Pair> {
     const GET_TYPE: usize = offset_of!(ID3D12CommandList_Vtbl, GetType) / size_of::<usize>();
     const END_QUERY: usize = offset_of!(ID3D12GraphicsCommandList_Vtbl, EndQuery) / size_of::<usize>();
     const RESOLVE: usize = offset_of!(ID3D12GraphicsCommandList_Vtbl, ResolveQueryData) / size_of::<usize>();
@@ -356,8 +399,6 @@ pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
         return None;
     }
-    let (a, b) = real::pso_shaders(super::pso_async::resolve(pso)).unwrap_or((0, 0));
-    let key = (kind, a, b);
     let (k, heap, buf, marks_va) = with_state(
         || {
             let mut dev: Option<ID3D12Device> = None;
@@ -385,6 +426,34 @@ pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32
     mark_done(list, marks_va + 8 * k as u64);
     (pair.end_query)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
     Some(pair)
+}
+
+/// (local) The union of `spans` in ticks, and the gaps between its pieces by length: counts and
+/// ticks under 20 us, 20-200 us, 0.2-2 ms, over 2 ms; [4].1 the longest.
+fn union_and_gaps(spans: &mut [(u64, u64)], hz: u64) -> (u64, [(u64, u64); 5]) {
+    spans.sort_unstable();
+    let us = |n: u64| n * hz / 1_000_000;
+    let (mut busy, mut gaps) = (0u64, [(0u64, 0u64); 5]);
+    let mut cur: Option<(u64, u64)> = None;
+    for &(b, e) in spans.iter() {
+        match cur {
+            Some((cb, ce)) if b <= ce => cur = Some((cb, ce.max(e))),
+            Some((cb, ce)) => {
+                busy += ce - cb;
+                let g = b - ce;
+                let k = if g < us(20) { 0 } else if g < us(200) { 1 } else if g < us(2000) { 2 } else { 3 };
+                gaps[k].0 += 1;
+                gaps[k].1 += g;
+                gaps[4].1 = gaps[4].1.max(g);
+                cur = Some((b, e));
+            }
+            None => cur = Some((b, e)),
+        }
+    }
+    if let Some((cb, ce)) = cur {
+        busy += ce - cb;
+    }
+    (busy, gaps)
 }
 
 /// The op of `pair` runs the counts in slot `slot` (`indirect_guard`).
@@ -415,7 +484,12 @@ fn poll() {
         }
         let Some(op) = &s.ops[k] else { continue };
         left -= 1;
-        let span = match stamps(s.word(2 * k).load(Ordering::Acquire), s.word(2 * k + 1).load(Ordering::Acquire)) {
+        let (b, e) = (s.word(2 * k).load(Ordering::Acquire), s.word(2 * k + 1).load(Ordering::Acquire));
+        if b != 0 && e >= b {
+            s.span = (if s.span.0 == 0 { b } else { s.span.0.min(b) }, s.span.1.max(e));
+            s.spans.push((b, e));
+        }
+        let span = match stamps(b, e) {
             Stamps::Pending => {
                 if s.mark(2 * k).load(Ordering::Acquire) != 0 && s.mark(2 * k + 1).load(Ordering::Acquire) == 0 {
                     s.running.entry(k).or_insert_with(Instant::now);
@@ -458,9 +532,16 @@ fn program(key: Key, shapes: &HashMap<u64, Shape>) -> String {
             });
             format!("CS {a:016x} {}{shape}", kind.name())
         }
-        Kind::Draw | Kind::IndirectDraw if a != 0 => format!("VS {a:016x} PS {b:016x} {}", kind.name()),
-        Kind::Draw | Kind::IndirectDraw => format!("{} with no console shader known", kind.name()),
+        Kind::Draw | Kind::IndirectDraw | Kind::TwoPass | Kind::IndirectTwoPass | Kind::OnePass | Kind::IndirectOnePass if a != 0 => format!("VS {a:016x} PS {b:016x} {}", kind.name()),
+        Kind::Draw | Kind::IndirectDraw | Kind::TwoPass | Kind::IndirectTwoPass | Kind::OnePass | Kind::IndirectOnePass => format!("{} with no console shader known", kind.name()),
         Kind::PcIndirect => kind.name().to_owned(),
+        Kind::Own => match a {
+            OWN_COUNT_CHECK => "XCL's own: the count check before an ExecuteIndirect (barrier, pipeline, dispatch)",
+            OWN_UPLOAD => "XCL's own: an upload of CPU writes (scatter dispatch)",
+            OWN_COPY_BACK => "XCL's own: a copy back for a CPU read",
+            _ => "XCL's own",
+        }
+        .to_owned(),
     }
 }
 
@@ -471,6 +552,9 @@ fn size_text(kind: Kind, size: [u32; 3]) -> String {
         Kind::IndirectDispatch if size[1..] != [0, 0] => format!("{}x{}x{} groups, the GPU's", size[0], size[1], size[2]),
         Kind::IndirectDraw if size[1..] != [0, 0] => format!("{} vertices or indices x {} instances, the GPU's", size[0], size[1]),
         Kind::IndirectDispatch | Kind::IndirectDraw | Kind::PcIndirect => format!("max count {} (its counts are the GPU's)", size[0]),
+        Kind::Own => format!("{} of them", size[0]),
+        Kind::TwoPass | Kind::OnePass => format!("{} groups", size[0]),
+        Kind::IndirectTwoPass | Kind::IndirectOnePass => format!("max count {}", size[0]),
     }
 }
 
@@ -489,7 +573,7 @@ fn report(elapsed: Duration, since_start: bool) -> bool {
     let (window, all, in_flight, lost, bad, running) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return false };
-        let all = since_start.then(|| (top(&s.since_start, TOP), sums(&s.since_start)));
+        let all = since_start.then(|| (top(&s.since_start, top_rows()), sums(&s.since_start)));
         let mut running: Vec<(u128, Key, [u32; 3])> = s
             .running
             .iter()
@@ -498,6 +582,24 @@ fn report(elapsed: Duration, since_start: bool) -> bool {
             .collect();
         running.sort_by(|a, b| b.0.cmp(&a.0));
         running.truncate(6);
+        let span = std::mem::take(&mut s.span);
+        if span.0 != 0 {
+            let (_, ticks) = sums(&s.window);
+            let own: u64 = s.window.iter().filter(|(k, _)| k.0 == Kind::Own).map(|(_, t)| t.ticks).sum();
+            crate::xlog_info!(
+                "D3D12.X: XCL_GPU_PROFILE: the window's ops lie within {:.1} ms on the GPU's clock: {:.1} ms in the title's ops, {:.1} ms in XCL's own that are timed, the rest in work that is not timed or idle",
+                (span.1 - span.0) as f64 * 1000.0 / hz as f64,
+                (ticks - own) as f64 * 1000.0 / hz as f64,
+                own as f64 * 1000.0 / hz as f64
+            );
+            let (busy, gaps) = union_and_gaps(&mut s.spans, hz);
+            let ms = |t: u64| t as f64 * 1000.0 / hz as f64;
+            crate::xlog_info!(
+                "D3D12.X: XCL_GPU_PROFILE: (local) timed ops cover {:.1} ms (overlaps counted once); gaps between them: {} under 20 us = {:.1} ms, {} of 20-200 us = {:.1} ms, {} of 0.2-2 ms = {:.1} ms, {} over 2 ms = {:.1} ms (longest {:.1} ms)",
+                ms(busy), gaps[0].0, ms(gaps[0].1), gaps[1].0, ms(gaps[1].1), gaps[2].0, ms(gaps[2].1), gaps[3].0, ms(gaps[3].1), ms(gaps[4].1)
+            );
+        }
+        s.spans.clear();
         (std::mem::take(&mut s.window), all, s.in_flight, s.lost, s.bad, running)
     };
     let ms = |ticks: u64| ticks as f64 * 1000.0 / hz as f64;
@@ -521,7 +623,7 @@ fn report(elapsed: Duration, since_start: bool) -> bool {
         }
     };
     if !window.is_empty() {
-        lines(&format!("last {:.1} s", elapsed.as_secs_f64()), top(&window, TOP), sums(&window));
+        lines(&format!("last {:.1} s", elapsed.as_secs_f64()), top(&window, top_rows()), sums(&window));
     }
     for (ms_running, key, size) in running {
         crate::xlog_warn!("D3D12.X: XCL_GPU_PROFILE: RUNNING for {ms_running} ms and not finished: {} ({})", program(key, &shapes), size_text(key.0, size));
@@ -535,6 +637,18 @@ fn report(elapsed: Duration, since_start: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_ops_count_once_and_gaps_are_binned() {
+        // 1 MHz clock: ticks are microseconds. [0,100] and [50,150] overlap; a 10 us gap, a 500 us gap, a 3 ms gap
+        let mut s = vec![(1160, 1200), (50, 150), (0, 100), (160, 200), (700, 1000), (4000, 4100)];
+        let (busy, g) = union_and_gaps(&mut s, 1_000_000);
+        assert_eq!(busy, 150 + 40 + 300 + 40 + 100);
+        assert_eq!(g[0], (1, 10));
+        assert_eq!(g[2], (1, 500));
+        assert_eq!(g[3], (1, 2800));
+        assert_eq!((g[1].0, g[4].1), (1, 2800));
+    }
 
     #[test]
     fn a_pair_counts_once_both_stamps_are_written_and_in_order() {

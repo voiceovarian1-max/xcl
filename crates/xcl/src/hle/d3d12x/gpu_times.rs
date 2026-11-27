@@ -336,6 +336,10 @@ pub(super) unsafe fn before_op(list: *mut c_void, pso: usize, kind: super::gpu_p
         P::Draw => (Kind::Graphics, false),
         P::IndirectDraw => (Kind::Graphics, true),
         P::PcIndirect => (Kind::Pc, true),
+        // (local) the kinds our GPU profile adds: XCL's own work is not the title's
+        P::Own => return,
+        P::TwoPass | P::OnePass => (Kind::Mesh("MS"), false),
+        P::IndirectTwoPass | P::IndirectOnePass => (Kind::Mesh("MS"), true),
     };
     before(list, pso, kind, size, indirect);
 }

@@ -1366,6 +1366,7 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
+            let _tm = crate::hle::api_cost::time(crate::hle::api_cost::Call::WindowMap);
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
@@ -1408,6 +1409,7 @@ impl State {
         }
         let offsets = vec![0u32; if poison.is_some() { counts.len() } else { 0 }];
         count_tile_calls(res_base, true, 1, tiles.len());
+        let _tm = crate::hle::api_cost::time(crate::hle::api_cost::Call::WindowUnmap);
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
@@ -2577,6 +2579,7 @@ pub fn readbacks_async() -> bool {
 /// Copies back that are done on the GPU, into the title's memory, and those whose title work
 /// is done (waiting for the copy): before a CPU read of memory the title's lists wrote.
 pub unsafe fn settle_readbacks() {
+    let _cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::SettleReadbacks);
     if RB_PENDING.load(Ordering::Acquire) == 0 {
         return;
     }

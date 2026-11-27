@@ -131,6 +131,10 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
 }
 
 pub(super) fn forget(resource: usize) {
+    pool_give_back(resource);
+    if let Some(f) = TPOOL_FREED.lock().unwrap().as_mut() {
+        f.remove(&resource);
+    }
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
@@ -139,6 +143,125 @@ pub(super) fn forget(resource: usize) {
         }
         super::placements::released(resource);
     }
+}
+
+/// (local experiment) `XCL_TEXTURE_POOL=1`: CPU-filled textures are placed resources in shared
+/// 64 MiB heaps (64 KiB slots) instead of reserved textures on tile-mapped pages. A title streaming
+/// ~650 new textures a second had ~24,000 tiles a second mapped; the sparse binds stalled the GPU
+/// whether the queues waited for them or not (runs 88, 91). A texture another replaces gives its
+/// slots back (after `COOL`); if it comes back later it is not uploaded again (`pool_freed`).
+fn pool_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_POOL").is_ok_and(|v| v.trim() == "1"))
+}
+
+const TPOOL_HEAP: usize = 64 << 20;
+const TPOOL_SLOTS: usize = TPOOL_HEAP / PAGE;
+
+struct PoolHeap {
+    dev: usize,
+    heap: ID3D12Heap,
+    /// per 64 KiB slot
+    used: Vec<bool>,
+    free: usize,
+    cursor: usize,
+}
+
+// D3D12 heaps are free-threaded
+unsafe impl Send for PoolHeap {}
+
+/// the heaps; slots given back (heap, first, slots, when), reused after `COOL`
+static TPOOL: Mutex<(Vec<PoolHeap>, Vec<(usize, usize, usize, std::time::Instant)>)> = Mutex::new((Vec::new(), Vec::new()));
+/// texture → (heap, first slot, slots)
+static TPOOL_OF: Mutex<Option<std::collections::HashMap<usize, (usize, usize, usize)>>> = Mutex::new(None);
+/// pooled textures whose slots went back while the texture lives on (another replaced it)
+static TPOOL_FREED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// `n` free slots in a row in `used`, searched round from `from`; taken.
+fn take_slots(used: &mut [bool], from: usize, n: usize) -> Option<usize> {
+    let len = used.len();
+    (0..len).map(|i| (from + i) % len).find(|&s| s + n <= len && used[s..s + n].iter().all(|&u| !u)).inspect(|&s| used[s..s + n].fill(true))
+}
+
+/// A CPU-filled texture in a pool heap (None: too big, MSAA, or no heap could be made).
+#[allow(clippy::too_many_arguments)]
+unsafe fn place_pooled(dev: &ID3D12Device, this: *mut c_void, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    if desc.SampleDesc.Count > 1 {
+        return None;
+    }
+    let info = dev.GetResourceAllocationInfo(0, &[*desc]);
+    if info.SizeInBytes == 0 || info.SizeInBytes == u64::MAX || info.Alignment as usize > PAGE {
+        return None;
+    }
+    let n = (info.SizeInBytes as usize).div_ceil(PAGE);
+    if n > TPOOL_SLOTS {
+        return None;
+    }
+    let key = dev.as_raw() as usize;
+    let now = std::time::Instant::now();
+    let (h, first, heap) = {
+        let mut g = TPOOL.lock().unwrap();
+        let (heaps, cooling) = &mut *g;
+        cooling.retain(|&(h, f, k, at)| {
+            if now.duration_since(at) < COOL {
+                return true;
+            }
+            heaps[h].used[f..f + k].fill(false);
+            heaps[h].free += k;
+            false
+        });
+        let found = heaps.iter_mut().enumerate().filter(|(_, p)| p.dev == key && p.free >= n).find_map(|(h, p)| {
+            let f = take_slots(&mut p.used, p.cursor, n)?;
+            p.free -= n;
+            p.cursor = f + n;
+            Some((h, f))
+        });
+        let (h, f) = match found {
+            Some(x) => x,
+            None => {
+                let hd = D3D12_HEAP_DESC {
+                    SizeInBytes: TPOOL_HEAP as u64,
+                    Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    Alignment: PAGE as u64,
+                    Flags: D3D12_HEAP_FLAG_NONE,
+                };
+                let mut heap: Option<ID3D12Heap> = None;
+                if let Err(e) = dev.CreateHeap(&hd, &mut heap) {
+                    crate::xlog_warn!("D3D12.X: texture pool: CreateHeap: {e}");
+                    return None;
+                }
+                let mut used = vec![false; TPOOL_SLOTS];
+                used[..n].fill(true);
+                heaps.push(PoolHeap { dev: key, heap: heap?, used, free: TPOOL_SLOTS - n, cursor: n });
+                let k = heaps.len();
+                if k <= 2 || k.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: texture pool: {k} heaps of 64 MB");
+                }
+                (k - 1, 0)
+            }
+        };
+        (h, f, heaps[h].heap.clone())
+    };
+    let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, first * PAGE, desc as *const _ as usize, state as usize, clear as usize, riid as *const _, ppv);
+    if hr < 0 || (*ppv).is_null() {
+        TPOOL.lock().unwrap().1.push((h, first, n, now));
+        return None;
+    }
+    TPOOL_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, (h, first, n));
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    Some(hr)
+}
+
+/// A pooled texture's slots go back (after `COOL`). True when it held some.
+fn pool_give_back(res: usize) -> bool {
+    let Some((h, f, n)) = TPOOL_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&res)) else { return false };
+    TPOOL.lock().unwrap().1.push((h, f, n, std::time::Instant::now()));
+    true
+}
+
+/// A pooled texture whose slots went back while it lives on: not to be uploaded again.
+pub(super) fn pool_freed(res: usize) -> bool {
+    TPOOL_FREED.lock().unwrap().as_ref().is_some_and(|f| f.contains(&res))
 }
 
 /// Whether a console texture with these D3D12_RESOURCE_FLAGS is the GPU's (render target,
@@ -814,6 +937,7 @@ impl Pages {
             }
             let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
             let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
+            let _tm = crate::hle::api_cost::time(crate::hle::api_cost::Call::PageMap);
             self.queue.UpdateTileMappings(
                 res,
                 1,
@@ -846,6 +970,7 @@ impl Pages {
         let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        let _tm = crate::hle::api_cost::time(crate::hle::api_cost::Call::PageUnmap);
         self.queue.UpdateTileMappings(
             res,
             1,
@@ -939,7 +1064,7 @@ impl Pages {
             let step = LOGGED.load(std::sync::atomic::Ordering::Relaxed);
             if n >= step {
                 LOGGED.store(n.max(1) * 2, std::sync::atomic::Ordering::Relaxed);
-                crate::xlog_info!("D3D12.X: page budget: {} textures evicted ({} MB back) this round, {n} so far", evicted.len(), (freed * PAGE) >> 20);
+                crate::xlog_info!("D3D12.X: page budget: {} textures evicted ({} MB back) this round, {n} so far; {}", evicted.len(), (freed * PAGE) >> 20, self.census(now));
             }
             let mut g = EVICTED.lock().unwrap();
             let s = g.get_or_insert_with(HashSet::new);
@@ -947,6 +1072,39 @@ impl Pages {
             EVICTED_LEN.store(s.len(), std::sync::atomic::Ordering::Relaxed);
         }
         freed
+    }
+
+    /// Page budget, for the log: what holds the pages – textures and megabytes of each kind (a
+    /// page that textures share counts for each of them).
+    fn census(&self, now: std::time::Instant) -> String {
+        // not mapped; the GPU's or not kept in step; small; used a moment ago; evictable now; named by a view
+        let mut n = [(0usize, 0usize); 6];
+        let views = VIEWS.lock().unwrap();
+        for (&r, t) in &self.targets {
+            let k = if !t.mapped {
+                0
+            } else if !t.evictable {
+                1
+            } else if t.total < EVICT_MIN_TILES {
+                2
+            } else if now.duration_since(t.touched) < EVICT_MIN_AGE {
+                3
+            } else if has_view(&views, r) {
+                5
+            } else {
+                4
+            };
+            n[k].0 += 1;
+            n[k].1 += t.total as usize;
+        }
+        // (tiles to megabytes)
+        for k in &mut n {
+            k.1 = (k.1 * PAGE) >> 20;
+        }
+        format!(
+            "{} textures not mapped ({} MB); mapped: {} not evictable (the GPU's, {} MB), {} under {EVICT_MIN_TILES} tiles ({} MB), {} used in the last {} s ({} MB), {} named by a view ({} MB), {} evictable now ({} MB)",
+            n[0].0, n[0].1, n[1].0, n[1].1, n[2].0, n[2].1, n[3].0, EVICT_MIN_AGE.as_secs(), n[3].1, n[5].0, n[5].1, n[4].0, n[4].1
+        )
     }
 
     /// The tiles of `range` a placement at `va` has no page for yet, and the pool heap of the
@@ -991,6 +1149,11 @@ impl Pages {
             if have < missing && self.evict_idle_until.is_none_or(|t| now >= t) {
                 if self.evict_lru((missing - have).max(EVICT_BATCH)) == 0 {
                     self.evict_idle_until = Some(now + EVICT_IDLE);
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 4 || n.is_power_of_two() {
+                        crate::xlog_info!("D3D12.X: page budget: nothing to evict (#{n}), {} pools: {}", self.pools.len(), self.census(now));
+                    }
                 } else {
                     // (an evicted texture may have shared a page with this placement)
                     (missing, preferred) = self.missing_tiles(va, first, own, range.clone());
@@ -1246,6 +1409,10 @@ pub(super) unsafe fn unmap_superseded_target(res: &ID3D12Resource) {
 
 unsafe fn unmap_placed(res: &ID3D12Resource, immediate_cool: bool) {
     let key = res.as_raw() as usize;
+    if pool_give_back(key) {
+        TPOOL_FREED.lock().unwrap().get_or_insert_with(HashSet::new).insert(key);
+        return;
+    }
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
@@ -1644,6 +1811,11 @@ pub unsafe fn place_pages(
     }
     if console_has_packed_3d_mips(desc) {
         return None;
+    }
+    if pool_on() {
+        if let Some(hr) = place_pooled(dev, this, desc, state, clear, riid, ppv) {
+            return Some(hr);
+        }
     }
     // (one slice: the tiles of an array's packed levels are not asked about here)
     let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
@@ -2836,6 +3008,22 @@ mod tests {
     }
 
     /// Texture pool: slots in a row, searched round the heap from the cursor.
+    #[test]
+    fn texture_pool_slots_are_taken_in_a_row() {
+        let mut used = vec![false; 8];
+        assert_eq!(take_slots(&mut used, 0, 3), Some(0));
+        assert_eq!(take_slots(&mut used, 3, 2), Some(3));
+        used[6] = true;
+        // 5 and 7 are free but not two in a row
+        assert_eq!(take_slots(&mut used, 5, 2), None);
+        assert_eq!(take_slots(&mut used, 5, 1), Some(5));
+        used[1] = false;
+        assert_eq!(take_slots(&mut used, 7, 1), Some(7));
+        assert_eq!(take_slots(&mut used, 0, 1), Some(1));
+        assert!(used.iter().all(|&u| u));
+    }
+
+    /// Page budget: a texture stays named while any view slot names it.
     #[test]
     fn page_budget_a_texture_stays_named_while_any_slot_names_it() {
         let (a, b) = (0x7fff_0001_0000usize, 0x7fff_0002_0000usize);

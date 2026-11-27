@@ -71,11 +71,19 @@ pub struct Kernel {
 pub use super::module::split::DispatchChain;
 
 pub fn dispatch_piece_limit() -> usize {
+    // (local experiment) `XCL_DXIL_VARIANTS` `split`: this program in chained pieces
+    if super::module::variant::current() & super::module::variant::SPLIT != 0 {
+        return 12_500;
+    }
     std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
 }
 
 /// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset uses automatic selection.
 pub fn compact_mode() -> Option<bool> {
+    // (local experiment) `XCL_DXIL_VARIANTS` `nocompact`
+    if super::module::variant::current() & super::module::variant::NOCOMPACT != 0 {
+        return Some(false);
+    }
     match std::env::var("XCL_DIRECT_COMPACT").as_deref() {
         Ok("1") => Some(true),
         Ok("0") => Some(false),
@@ -207,10 +215,11 @@ fn translate_entry_with(
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
+    let variant = super::module::variant::current();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables, rodata))
+        .spawn(move || super::module::variant::with(variant, || translate_on_this_thread(&code, o, entry, compact, nest, tables, rodata)))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {

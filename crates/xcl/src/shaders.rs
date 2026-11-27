@@ -1506,6 +1506,12 @@ impl Pipelines {
 
     fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
+        // local experiment (not upstream): see `driver_cache::over_cap`
+        if crate::hle::d3d12x::real::driver_cache::over_cap(dxil.len()) {
+            eprintln!("  pipeline of {} B DXIL is over XCL_MAX_CS_DXIL_MB: not made", dxil.len());
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
             let mut g = self.signatures.lock().unwrap();
@@ -2155,6 +2161,13 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 if startup.and_then(|p| p.only.as_ref()).is_some_and(|used| !used.contains(&crate::hle::d3d12x::real::shader_key(&blob))) {
                     unused.fetch_add(1, Ordering::Relaxed);
                     record_done();
+                    continue;
+                }
+                // (local experiment) `XCL_PRECOMPILE_ONLY=h1+h2`: only these console programs
+                static ONLY_HASHES: std::sync::OnceLock<Option<std::collections::HashSet<u64>>> = std::sync::OnceLock::new();
+                let only_hashes = ONLY_HASHES.get_or_init(|| std::env::var("XCL_PRECOMPILE_ONLY").ok().map(|v| v.split('+').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()));
+                if only_hashes.as_ref().is_some_and(|set| !set.contains(&crate::gpu::shader::fnv64(&blob))) {
+                    done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
@@ -2936,8 +2949,10 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                         let r = {
                             let (tx, rx) = std::sync::mpsc::channel();
                             let (c, m, rodata) = (code.to_vec(), mode.clone(), f.rodata(p));
+                            // (local experiment) the program's `XCL_DXIL_VARIANTS` variant, as a title's pipeline gets it
+                            let variant = crate::gpu::dxil::module::variant::for_record(blob_hash);
                             std::thread::spawn(move || {
-                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate, &rodata));
+                                let _ = tx.send(crate::gpu::dxil::module::variant::with(variant, || coverage::translate_mode(&c, &m, o, validate, &rodata)));
                             });
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
