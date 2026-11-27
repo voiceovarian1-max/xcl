@@ -161,6 +161,9 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(out.status.success(), "exit code {:?}", out.status.code());
 
     let log = std::fs::read_to_string(data.join("XCL.TestTitle/logs/xcl.log")).unwrap();
+    let backend_init = log.find("D3D12.X: backend '").expect("backend initialized");
+    let dll_init = log.find("DllMain(").expect("dependent DLL initialized");
+    assert!(backend_init < dll_init, "D3D12 backend initialized after title DLL code ran");
     let window = |tag| log.lines().find_map(|line| line.split_once(tag).map(|(_, hwnd)| hwnd)).unwrap();
     assert_eq!(window("Shader preparation window "), window("present: swap chain window "));
 

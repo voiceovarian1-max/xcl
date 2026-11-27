@@ -200,12 +200,31 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
     for (ty, payload) in subs {
         match ty {
             0 | 19 => {} // RS replaced by ABI RS via ps_samplers; CACHED_PSO is the lookup input
-            7 | 12 | 22 => {
-                if payload.iter().any(|&b| b != 0) {
+            // These descriptors can carry inert pointers and padding in a title stream.
+            // Their counts and flags determine whether any state needs to be hashed.
+            7 => {
+                let state = read_state::<D3D12_STREAM_OUTPUT_DESC>(payload)?;
+                if state.NumEntries != 0 || state.NumStrides != 0 || state.RasterizedStream != 0 {
+                    return None;
+                }
+            }
+            12 => {
+                let state = read_state::<D3D12_INPUT_LAYOUT_DESC>(payload)?;
+                if state.NumElements != 0 {
+                    return None;
+                }
+            }
+            22 => {
+                let state = read_state::<D3D12_VIEW_INSTANCING_DESC>(payload)?;
+                if state.ViewInstanceCount != 0 || state.Flags.0 != 0 {
                     return None;
                 }
             }
             1..=6 | 24 | 25 => {
+                let state = read_state::<D3D12_SHADER_BYTECODE>(payload)?;
+                if state.BytecodeLength == 0 && ty != 25 {
+                    continue;
+                }
                 let code = payload_shader(payload)?;
                 shader_bytes = shader_bytes.checked_add(code.len())?;
                 h.u32(ty);
@@ -330,6 +349,49 @@ mod tests {
             let il = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: 0x1234 as *const _, NumElements: 1 };
             with_il.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &il);
             assert_eq!(two_pass_stream_key(&with_il.0, &[], 1, 1), None);
+        }
+    }
+
+    #[test]
+    fn empty_stream_descriptors_do_not_change_the_key() {
+        let ms = [1u8, 2, 3, 4];
+        let mut base = StreamOut::default();
+        base.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+        let mut with_empty = StreamOut(base.0.clone(), base.1);
+        with_empty.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT, &D3D12_STREAM_OUTPUT_DESC {
+            pSODeclaration: 0x2000 as *const _,
+            pBufferStrides: 0x3000 as *const _,
+            ..Default::default()
+        });
+        let mut input = [0u8; std::mem::size_of::<D3D12_INPUT_LAYOUT_DESC>()];
+        input[..8].copy_from_slice(&0x4000u64.to_le_bytes());
+        let padding = std::mem::offset_of!(D3D12_INPUT_LAYOUT_DESC, NumElements) + std::mem::size_of::<u32>();
+        input[padding..].fill(0xaa);
+        with_empty.raw(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT.0 as u32, &input, true);
+        with_empty.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, &D3D12_VIEW_INSTANCING_DESC {
+            pViewInstanceLocations: 0x5000 as *const _,
+            ..Default::default()
+        });
+        let empty_shader = D3D12_SHADER_BYTECODE { pShaderBytecode: 0x6000 as *const _, BytecodeLength: 0 };
+        for stage in [
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS,
+        ] {
+            with_empty.put(stage, &empty_shader);
+        }
+
+        unsafe {
+            let key = two_pass_stream_key(&base.0, &[], 1, 4).expect("base mesh key");
+            assert_eq!(two_pass_stream_key(&with_empty.0, &[], 1, 4), Some(key));
+
+            let mut empty_ms = StreamOut::default();
+            empty_ms.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &empty_shader);
+            assert_eq!(two_pass_stream_key(&empty_ms.0, &[], 1, 4), None);
         }
     }
 

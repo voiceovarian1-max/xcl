@@ -138,6 +138,8 @@ pub struct Uma {
     /// cannot take it – a title that commits all of unified memory at start (Unicorn
     /// Overlord: 2046 of 2048 MB) left no room for draw arguments, and draws were skipped.
     pool: Mutex<(usize, usize, Vec<usize>)>,
+    /// windows remade as driver heaps (`hle::d3d12x::uma_driver`), one bit each
+    driver: std::sync::atomic::AtomicU32,
 }
 
 /// bytes of XCL's arena pool (`Uma::new`)
@@ -406,6 +408,7 @@ impl Uma {
                 views: Mutex::new(views),
                 shadowed: AtomicBool::new(false),
                 pool: Mutex::new((0, 0, Vec::new())),
+                driver: Default::default(),
             };
             u.reserve_pool(POOL);
             return Some(u);
@@ -518,6 +521,16 @@ impl Uma {
     /// Whether `p` is in a committed window.
     pub fn is_committed(&self, p: usize) -> bool {
         self.window_of(p).is_some_and(|k| self.is_committed_window(k))
+    }
+
+    /// Window `k` is a driver heap now (`hle::d3d12x::uma_driver`).
+    pub fn set_driver_window(&self, k: usize) {
+        self.driver.fetch_or(1 << k, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether window `k` is a driver heap (`set_driver_window`).
+    pub fn is_driver_window(&self, k: usize) -> bool {
+        k < 32 && self.driver.load(std::sync::atomic::Ordering::Relaxed) & (1 << k) != 0
     }
 
     /// Whether `[p, p + len)` lies in a committed coherent window – memory that is committed and
@@ -685,6 +698,7 @@ impl Uma {
                     views: Mutex::new(Default::default()),
                     shadowed: AtomicBool::new(false),
                     pool: Mutex::new((0, 0, Vec::new())),
+                    driver: Default::default(),
                 });
             }
             for p in got {

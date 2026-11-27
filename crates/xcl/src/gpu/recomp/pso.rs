@@ -2057,17 +2057,8 @@ mod shader_cache_tests {
 
     fn synthetic_mesh_container() -> Vec<u8> {
         use crate::gpu::xbox::tests::{container, dxil_part, fssm, CODE};
-        let mut psv_r = vec![0u8; 48];
-        psv_r[12..14].copy_from_slice(&3u16.to_le_bytes()); // max_vertices
-        psv_r[14..16].copy_from_slice(&1u16.to_le_bytes()); // max_primitives
-        psv_r[24] = 13; // mesh
-        psv_r[27] = 2; // triangles
-        psv_r[36..40].copy_from_slice(&32u32.to_le_bytes());
-        psv_r[40..44].copy_from_slice(&1u32.to_le_bytes());
-        psv_r[44..48].copy_from_slice(&1u32.to_le_bytes());
-        let mut psv0 = 48u32.to_le_bytes().to_vec();
-        psv0.extend_from_slice(&psv_r);
-        psv0.extend_from_slice(&0u32.to_le_bytes());
+        use crate::gpu::xbox::shader_container::mesh_psv;
+        let psv0 = mesh_psv(3, 1, [32, 1, 1], [0, 0]);
 
         // Minimal OSG1 with SV_Position (system_value = 1, mask = 0xF, float = 3).
         let name = b"SV_Position\0";

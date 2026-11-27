@@ -51,6 +51,7 @@ mod submit_cost;
 mod texture_upload;
 pub mod title_textures;
 pub mod view_want;
+mod uma_driver;
 pub mod vram;
 mod worker_pool;
 
@@ -92,15 +93,16 @@ pub enum Backend {
 }
 
 /// Decided once: the real backend unless disabled or the driver refuses.
-pub fn backend() -> Backend {
-    static B: OnceLock<Backend> = OnceLock::new();
-    *B.get_or_init(|| {
+static BACKEND: OnceLock<Backend> = OnceLock::new();
+
+fn backend_with_remap(allow_driver_remap: bool) -> Backend {
+    *BACKEND.get_or_init(|| {
         let cfg = crate::state::config();
         if cfg.graphics.eq_ignore_ascii_case("null") {
             crate::xlog_info!("D3D12.X: backend 'null' (from the config)");
             return Backend::Null;
         }
-        match real::init() {
+        match real::init_with_remap(allow_driver_remap) {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
                 Backend::Real
@@ -111,6 +113,14 @@ pub fn backend() -> Backend {
             }
         }
     })
+}
+
+pub fn backend() -> Backend {
+    backend_with_remap(false)
+}
+
+pub(crate) fn backend_before_guest() -> Backend {
+    backend_with_remap(true)
 }
 
 /// Call a function of the system d3d12.dll by name.

@@ -353,7 +353,7 @@ fn shadow_choice() -> Option<bool> {
     std::env::var("XCL_UMA_SHADOW").ok().map(|v| v != "0")
 }
 
-unsafe fn open_uma(device: &ID3D12Device) {
+unsafe fn open_uma(device: &ID3D12Device, allow_driver_remap: bool) {
     let Some(u) = crate::gpu::uma::get() else {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
         return;
@@ -401,6 +401,20 @@ unsafe fn open_uma(device: &ID3D12Device) {
     for k in 0..n {
         if !u.is_committed_window(k) {
             continue;
+        }
+        // (XCL PR #2844) on NVIDIA a driver heap at the window's address instead of the import
+        if allow_driver_remap && super::uma_driver::wanted(device) {
+            let (base, size) = u.window(k);
+            match super::uma_driver::remake(device, base, size) {
+                Ok((heap, buf)) => {
+                    u.set_driver_window(k);
+                    let (buf_raw, va, heap_raw) = super::uma_driver::raw(heap, buf);
+                    bufs[k] = (buf_raw, va);
+                    heaps[k] = Some(heap_raw);
+                    continue;
+                }
+                Err(e) => crate::xlog_warn!("D3D12.X: coherent window {k} stays imported: {e}"),
+            }
         }
         let made = open(k).and_then(|heap| {
             let shadowed = heap.is_none();
@@ -582,6 +596,10 @@ fn graphics_wave32(device: *mut c_void) -> bool {
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
 pub fn init() -> Result<String, String> {
+    init_with_remap(false)
+}
+
+pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String> {
     // one at a time: two threads that both found no device made one each and opened the memory
     // windows for it, and GPU work on the one device with window addresses of the other hung the
     // GPU (unit tests; a title comes in through `backend`, which asks once)
@@ -671,7 +689,7 @@ pub fn init() -> Result<String, String> {
                 let _ = q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie);
             }
         }
-        open_uma(&device);
+        open_uma(&device, allow_driver_remap);
         super::device_x::probe_dynamic_depth_bias(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
@@ -1639,11 +1657,10 @@ fn uma_shadowed() -> bool {
 
 /// Sanitize a console buffer description and initial state for placement in a coherent
 /// cross-adapter UMA heap (`OpenExistingHeapFromAddress`).
-fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize) -> (D3D12_RESOURCE_DESC, u32) {
+fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize, cross_adapter: bool) -> (D3D12_RESOURCE_DESC, u32) {
     let mut d = *desc;
     d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF);
-    // a shadowed window's heap is video memory, not a cross-adapter heap over process memory
-    if !uma_shadowed() {
+    if cross_adapter && !uma_shadowed() {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     }
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -1682,8 +1699,8 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
         return None;
     };
     // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + sanitized flags & state
-    let (d, st) = sanitize_coherent_buffer(&d, state);
     let k = u.window_of(p)?;
+    let (d, st) = sanitize_coherent_buffer(&d, state, !u.is_driver_window(k));
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
     let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, st as usize, clear, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
@@ -1773,7 +1790,7 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         return Some(hr);
     }
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
-    if !u.shadowed() {
+    if !u.shadowed() && !u.is_driver_window(k) {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     }
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -9785,7 +9802,7 @@ mod readback_routing_tests {
         };
         let console_state = 0x0010_0000usize | (D3D12_RESOURCE_STATE_COPY_DEST.0 as usize);
 
-        let (clean, st) = sanitize_coherent_buffer(&raw_desc, console_state);
+        let (clean, st) = sanitize_coherent_buffer(&raw_desc, console_state, true);
         assert_eq!(clean.Alignment, 0);
         assert_eq!(clean.Layout, D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
         assert_eq!(

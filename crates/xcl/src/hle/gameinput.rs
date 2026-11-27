@@ -2,20 +2,21 @@
 //!
 //! The title gets the console's GameInput interfaces (the public GameInput.h of the GDK, v0:
 //! IGameInput, IGameInputDevice, IGameInputReading as COM objects with the methods in that
-//! header's order) with one device: a gamepad that is always connected. A reading is the
-//! state at the moment it is asked for – the PC's first XInput controller (else a PlayStation
-//! controller, `playstation`), and the keyboard
-//! while a window of this process has the focus (Enter / Space A, Escape / Backspace B,
+//! header's order) with one device: a gamepad that is always connected. Readings sample
+//! the PC's first XInput controller (or a PlayStation controller when XInput is absent) and
+//! the keyboard while a window of this process has the focus (Enter / Space A, Escape / Backspace B,
 //! arrows the D-pad, Tab View, P Menu). Windows' own GameInput.dll is not used: its
 //! interfaces are not the console's and it reads only for a foreground app of its own.
 //! Device callbacks report the gamepad (at once for a blocking enumeration, from another
-//! thread for an asynchronous one); reading callbacks get a reading when the state changes
-//! (polled at 250 Hz). Methods not listed log their slot once and fail.
+//! thread for an asynchronous one). One poller samples the gamepad about every 4 ms.
+//! State changes enter a half-second history and reach the reading callbacks.
+//! Methods not listed log their slot once and fail.
 //!
 //! `XCL_PRESS_A_AT=s1,s2…`: press A for 200 ms at those seconds after start (tests).
 
 #![allow(non_snake_case)]
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -28,6 +29,7 @@ use crate::util::{E_NOINTERFACE, E_NOTIMPL, E_POINTER, HRESULT, S_OK};
 
 const GAMEINPUT_E_DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 const GAMEINPUT_E_READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
+const GAMEINPUT_E_REFERENCE_READING_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 
 // Verified GameInput v0 interface GUIDs (Windows SDK / GDK `GameInput.h`).
 const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
@@ -454,8 +456,8 @@ fn input() -> *mut Object {
                 (2, release as usize),
                 (3, get_current_timestamp as usize),
                 (4, get_current_reading as usize),
-                (5, other_reading as usize),
-                (6, other_reading as usize),
+                (5, other_reading::<true> as usize),
+                (6, other_reading::<false> as usize),
                 (7, get_temporal_reading as usize),
                 (8, register_reading_callback as usize),
                 (9, register_device_callback as usize),
@@ -513,10 +515,113 @@ fn reading_vtable() -> *const usize {
     }) as *const usize
 }
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// One owned COM reference, held by the history or a callback dispatch.
+struct OwnedReading(*mut Reading);
 
-fn new_reading(state: GamepadState) -> *mut Reading {
-    Box::into_raw(Box::new(Reading { vtable: reading_vtable(), refs: AtomicU32::new(1), state, sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1, timestamp: now_us() }))
+// SAFETY: a reading is immutable except for its atomic reference count. Its
+// vtable has process lifetime, and this owner keeps the allocation alive.
+unsafe impl Send for OwnedReading {}
+
+impl OwnedReading {
+    fn new(state: GamepadState, sequence: u64, timestamp: u64) -> Self {
+        Self(Box::into_raw(Box::new(Reading {
+            vtable: reading_vtable(),
+            refs: AtomicU32::new(1),
+            state,
+            sequence,
+            timestamp,
+        })))
+    }
+
+    fn reading(&self) -> &Reading {
+        // SAFETY: this owner holds a reference for at least the lifetime of the borrow.
+        unsafe { &*self.0 }
+    }
+
+    fn into_raw(self) -> *mut Reading {
+        let ptr = self.0;
+        std::mem::forget(self);
+        ptr
+    }
+}
+
+impl Clone for OwnedReading {
+    fn clone(&self) -> Self {
+        // SAFETY: self owns a reference.
+        unsafe { reading_add_ref(self.0) };
+        Self(self.0)
+    }
+}
+
+impl Drop for OwnedReading {
+    fn drop(&mut self) {
+        // SAFETY: release the reference owned by self.
+        unsafe { reading_release(self.0) };
+    }
+}
+
+const POLL_INTERVAL_MS: u64 = 4;
+const HISTORY_US: u64 = 500_000;
+const HISTORY_CAPACITY: usize = (HISTORY_US / (POLL_INTERVAL_MS * 1000)) as usize + 1;
+
+struct ReadingHistory {
+    readings: VecDeque<OwnedReading>,
+    /// A title can still use the reading preceding the retained window to
+    /// advance to its immediate successor after a long period of no input.
+    predecessor: Option<OwnedReading>,
+}
+
+static HISTORY: Mutex<ReadingHistory> = Mutex::new(ReadingHistory::new());
+static READING_READY: Condvar = Condvar::new();
+
+impl ReadingHistory {
+    const fn new() -> Self {
+        Self { readings: VecDeque::new(), predecessor: None }
+    }
+
+    fn prune(&mut self, now: u64) {
+        while self.readings.len() > 1
+            && (self.readings.len() > HISTORY_CAPACITY
+                || self.readings.front().is_some_and(|r| now.saturating_sub(r.reading().timestamp) > HISTORY_US))
+        {
+            self.predecessor = self.readings.pop_front();
+        }
+    }
+
+    fn sequence(&self) -> u64 {
+        self.readings.back().map_or(0, |r| r.reading().sequence)
+    }
+
+    fn record(&mut self, state: GamepadState, now: u64) -> bool {
+        let changed = self.readings.back().is_none_or(|r| r.reading().state != state);
+        if changed {
+            let reading = OwnedReading::new(state, self.sequence() + 1, now);
+            self.readings.push_back(reading);
+        }
+        self.prune(now);
+        changed
+    }
+
+    fn next_after(&self, sequence: u64) -> Option<OwnedReading> {
+        self.readings.iter().find(|r| r.reading().sequence > sequence).cloned()
+    }
+
+    fn adjacent<const NEXT: bool>(&mut self, reference: *mut Reading, now: u64) -> Result<OwnedReading, HRESULT> {
+        self.prune(now);
+        let Some(index) = self.readings.iter().position(|r| r.0 == reference) else {
+            if NEXT && self.predecessor.as_ref().is_some_and(|r| r.0 == reference) {
+                return self
+                    .readings
+                    .front()
+                    .filter(|r| now.saturating_sub(r.reading().timestamp) <= HISTORY_US)
+                    .cloned()
+                    .ok_or(GAMEINPUT_E_REFERENCE_READING_TOO_OLD);
+            }
+            return Err(GAMEINPUT_E_REFERENCE_READING_TOO_OLD);
+        };
+        let neighbor = if NEXT { index.checked_add(1) } else { index.checked_sub(1) };
+        neighbor.and_then(|i| self.readings.get(i)).cloned().ok_or(GAMEINPUT_E_READING_NOT_FOUND)
+    }
 }
 
 // ---- shared methods ----
@@ -622,6 +727,23 @@ fn note_query(what: &str, kind: u32) {
 
 unsafe extern "system" fn get_current_reading(_this: *mut Object, kind: u32, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
     note_query("GetCurrentReading", kind);
+    current_reading(kind, dev, out, || {
+        let started = start_poller();
+        let mut history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+        // If the worker cannot start, current reads still sample the gamepad.
+        if !started && history.record(poll(), now_us()) {
+            READING_READY.notify_one();
+        }
+        history.readings.back().cloned()
+    })
+}
+
+unsafe fn current_reading(
+    kind: u32,
+    dev: *mut c_void,
+    out: *mut *mut Reading,
+    latest: impl FnOnce() -> Option<OwnedReading>,
+) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
@@ -629,17 +751,50 @@ unsafe extern "system" fn get_current_reading(_this: *mut Object, kind: u32, dev
     if kind & KINDS == 0 || !ours(dev) {
         return GAMEINPUT_E_READING_NOT_FOUND;
     }
-    *out = new_reading(poll());
+    let Some(reading) = latest() else {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    };
+    *out = reading.into_raw();
     S_OK
 }
 
-/// the readings before and after one are not kept
-unsafe extern "system" fn other_reading(_this: *mut Object, _reference: *mut c_void, kind: u32, _dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
+unsafe extern "system" fn other_reading<const NEXT: bool>(
+    _this: *mut Object,
+    reference: *mut Reading,
+    kind: u32,
+    dev: *mut c_void,
+    out: *mut *mut Reading,
+) -> HRESULT {
     note_query("GetNext/PreviousReading", kind);
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
+    adjacent_reading::<NEXT>(&HISTORY, reference, kind, dev, out, now_us())
+}
+
+unsafe fn adjacent_reading<const NEXT: bool>(
+    history: &Mutex<ReadingHistory>,
+    reference: *mut Reading,
+    kind: u32,
+    dev: *mut c_void,
+    out: *mut *mut Reading,
+    now: u64,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
     }
-    GAMEINPUT_E_READING_NOT_FOUND
+    *out = std::ptr::null_mut();
+    if reference.is_null() {
+        return E_POINTER;
+    }
+    if kind & KINDS == 0 || !ours(dev) {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    }
+    let mut history = history.lock().unwrap_or_else(|e| e.into_inner());
+    match history.adjacent::<NEXT>(reference, now) {
+        Ok(reading) => {
+            *out = reading.into_raw();
+            S_OK
+        }
+        Err(hr) => hr,
+    }
 }
 
 unsafe extern "system" fn get_temporal_reading(this: *mut Object, _timestamp: u64, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
@@ -652,7 +807,7 @@ type ReadingCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Reading,
 type DeviceCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Object, u64, u32, u32);
 
 enum CallbackKind {
-    Reading { ctx: usize, cb: ReadingCallback },
+    Reading { ctx: usize, cb: ReadingCallback, after_sequence: u64 },
     Device,
 }
 
@@ -762,14 +917,22 @@ unsafe extern "system" fn register_reading_callback(_this: *mut Object, dev: *mu
         *token = t;
     }
     if let Some(cb) = cb.filter(|_| kind & KINDS != 0 && ours(dev)) {
-        let entry = Arc::new(CallbackEntry::new(t, CallbackKind::Reading { ctx: context as usize, cb }));
-        CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
         start_poller();
+        let history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+        let after_sequence = history.sequence();
+        track_reading_callback(t, context, cb, after_sequence);
+        start_reading_dispatcher(after_sequence);
     }
     S_OK
 }
 
-fn dispatch_reading_callbacks(s: GamepadState) {
+fn track_reading_callback(token: u64, context: *mut c_void, cb: ReadingCallback, after_sequence: u64) {
+    let entry = Arc::new(CallbackEntry::new(token, CallbackKind::Reading { ctx: context as usize, cb, after_sequence }));
+    CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+}
+
+fn dispatch_reading_callbacks(reading: &OwnedReading, previous: u64) {
+    let sequence = reading.reading().sequence;
     let cbs: Vec<Arc<CallbackEntry>> = CALLBACKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -778,36 +941,73 @@ fn dispatch_reading_callbacks(s: GamepadState) {
         .cloned()
         .collect();
     for entry in cbs {
-        let CallbackKind::Reading { ctx, cb } = entry.kind else { continue };
-        let Some(_guard) = entry.try_enter() else { continue };
-        let r = new_reading(s);
-        // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
-        // `UnregisterCallback` blocked until `cb` returns so `ctx` stays valid.
-        unsafe {
-            cb(entry.token, ctx as *mut c_void, r, false);
-            reading_release(r);
+        let CallbackKind::Reading { ctx, cb, after_sequence } = entry.kind else { continue };
+        if sequence <= after_sequence {
+            continue;
         }
+        let Some(_guard) = entry.try_enter() else { continue };
+        let overrun = sequence - previous.max(after_sequence) > 1;
+        // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
+        // `UnregisterCallback` blocked until `cb` returns, and reading is borrowed
+        // from a live owner throughout the call.
+        unsafe { cb(entry.token, ctx as *mut c_void, reading.0, overrun) };
     }
 }
 
-/// A thread that calls the reading callbacks when the gamepad's state changes.
-fn start_poller() {
+/// Deliver callbacks in order on a different thread so guest code cannot
+/// stall sampling. If the worker falls behind, resume at the oldest retained
+/// reading and report the skipped readings through the v0 overrun flag.
+fn start_reading_dispatcher(after_sequence: u64) {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
-        let _ = std::thread::Builder::new().name("xcl-gameinput".into()).spawn(|| {
+        let worker = std::thread::Builder::new().name("xcl-gameinput-callback".into()).spawn(move || {
             crate::eh::arm_current_thread();
-            let mut last = GamepadState::default();
+            let mut previous = after_sequence;
             loop {
-                std::thread::sleep(Duration::from_millis(4));
-                let s = poll();
-                if s == last {
-                    continue;
+                let reading = {
+                    let history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut history = READING_READY
+                        .wait_while(history, |history| history.sequence() <= previous)
+                        .unwrap_or_else(|e| e.into_inner());
+                    history.prune(now_us());
+                    history.next_after(previous)
+                };
+                if let Some(reading) = reading {
+                    dispatch_reading_callbacks(&reading, previous);
+                    previous = reading.reading().sequence;
                 }
-                last = s;
-                dispatch_reading_callbacks(s);
             }
         });
+        if let Err(e) = worker {
+            crate::xlog_warn!("GameInput: could not start reading callback worker: {e}");
+        }
     });
+}
+
+/// One sampler for current, historical and callback reads. In particular,
+/// sampling consumes mouse deltas, so the query and worker must not both poll.
+fn start_poller() -> bool {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    *STARTED.get_or_init(|| {
+        // Seed before starting the worker or returning the first current reading.
+        let initial = poll();
+        HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record(initial, now_us());
+        let worker = std::thread::Builder::new().name("xcl-gameinput".into()).spawn(|| {
+            crate::eh::arm_current_thread();
+            loop {
+                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+                let state = poll();
+                if HISTORY.lock().unwrap_or_else(|e| e.into_inner()).record(state, now_us()) {
+                    READING_READY.notify_one();
+                }
+            }
+        });
+        if let Err(e) = worker {
+            crate::xlog_warn!("GameInput: could not start reading poller: {e}");
+            return false;
+        }
+        true
+    })
 }
 
 /// RegisterDeviceCallback(device, kind, status filter, enumeration kind, context, callback,
@@ -1014,18 +1214,133 @@ mod tests {
     #[test]
     fn readings_come_and_go() {
         unsafe {
-            let g = input();
+            let reading = OwnedReading::new(GamepadState { buttons: A, ..Default::default() }, 1, 1);
             let mut r = std::ptr::null_mut();
-            assert_eq!(get_current_reading(g, KIND_GAMEPAD, std::ptr::null_mut(), &mut r), S_OK);
-            let mut s = GamepadState { buttons: 99, ..Default::default() };
+            assert_eq!(current_reading(KIND_GAMEPAD, std::ptr::null_mut(), &mut r, || Some(reading.clone())), S_OK);
+            assert_eq!(r, reading.0);
+            let mut s = GamepadState::default();
             assert!(reading_gamepad(r, &mut s));
-            assert_ne!(s.buttons, 99);
+            assert_eq!(s.buttons, A);
             let mut d = std::ptr::null_mut();
             reading_device(r, &mut d);
             assert_eq!(d, device());
-            assert_eq!(reading_release(r), 0);
-            assert_eq!(get_current_reading(g, 0x10, std::ptr::null_mut(), &mut r), GAMEINPUT_E_READING_NOT_FOUND, "keyboard kind");
+            assert_eq!(reading_release(r), 1);
+            assert_eq!(
+                current_reading(0x10, std::ptr::null_mut(), &mut r, || panic!("keyboard kind")),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            assert!(r.is_null());
         }
+    }
+
+    fn record_test_reading(history: &mut ReadingHistory, buttons: u32, now: u64) -> OwnedReading {
+        assert!(history.record(GamepadState { buttons, ..Default::default() }, now));
+        history.readings.back().unwrap().clone()
+    }
+
+    #[test]
+    fn adjacent_readings_preserve_a_tap_after_idle() {
+        let pressed_at = HISTORY_US + 2;
+        let now = pressed_at + 3;
+        let history = Mutex::new(ReadingHistory::new());
+        let (neutral, pressed, released) = {
+            let mut stream = history.lock().unwrap();
+            let neutral = record_test_reading(&mut stream, 0, 1);
+            let pressed = record_test_reading(&mut stream, A, pressed_at);
+            assert!(!stream.record(pressed.reading().state, pressed_at + 1));
+            let released = record_test_reading(&mut stream, 0, pressed_at + 2);
+            assert_eq!(stream.readings.back().unwrap().0, released.0);
+            (neutral, pressed, released)
+        };
+        // Use the same out-pointer and filtering path as the IGameInput vtable.
+        let mut out = std::ptr::null_mut();
+        unsafe {
+            let any_device = std::ptr::null_mut();
+            assert_eq!(adjacent_reading::<true>(&history, neutral.0, KIND_GAMEPAD, any_device, &mut out, now), S_OK);
+            assert_eq!(out, pressed.0);
+            let mut state = GamepadState::default();
+            assert!(reading_gamepad(out, &mut state));
+            assert_eq!(state.buttons, A);
+            assert_eq!(reading_timestamp(out), pressed_at);
+            assert!(reading_sequence(out, KIND_GAMEPAD) > reading_sequence(neutral.0, KIND_GAMEPAD));
+            reading_release(out);
+
+            assert_eq!(adjacent_reading::<true>(&history, pressed.0, KIND_GAMEPAD, any_device, &mut out, now), S_OK);
+            assert_eq!(out, released.0);
+            assert!(reading_gamepad(out, &mut state));
+            assert_eq!(state.buttons, 0);
+            reading_release(out);
+
+            let gamepad = device().cast();
+            assert_eq!(adjacent_reading::<false>(&history, released.0, KIND_GAMEPAD, gamepad, &mut out, now), S_OK);
+            assert_eq!(out, pressed.0);
+            reading_release(out);
+
+            assert_eq!(
+                adjacent_reading::<true>(&history, released.0, KIND_GAMEPAD, gamepad, &mut out, now),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            assert!(out.is_null());
+        }
+    }
+
+    #[test]
+    fn adjacent_readings_check_inputs_and_keep_caller_references_alive() {
+        use std::ptr::{dangling_mut, null_mut};
+        let history = Mutex::new(ReadingHistory::new());
+        let (old, latest) = {
+            let mut stream = history.lock().unwrap();
+            let old = record_test_reading(&mut stream, A, 1);
+            let latest = record_test_reading(&mut stream, 0, HISTORY_US + 1);
+            (old, latest)
+        };
+        let valid = KIND_GAMEPAD;
+        let mut out = dangling_mut();
+        unsafe {
+            assert_eq!(adjacent_reading::<true>(&history, old.0, valid, null_mut(), null_mut(), 1), E_POINTER);
+            assert_eq!(adjacent_reading::<true>(&history, null_mut(), valid, null_mut(), &mut out, 1), E_POINTER);
+            assert!(out.is_null());
+            assert_eq!(
+                adjacent_reading::<true>(&history, old.0, 0x10, null_mut(), &mut out, 1),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            assert_eq!(
+                adjacent_reading::<true>(&history, old.0, valid, dangling_mut::<Object>().cast(), &mut out, 1),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+
+            // At the retention boundary the old reading is still available.
+            assert_eq!(adjacent_reading::<false>(&history, latest.0, valid, null_mut(), &mut out, HISTORY_US + 1), S_OK);
+            assert_eq!(out, old.0);
+            let caller_ref = out;
+            drop(old);
+            assert_eq!(
+                adjacent_reading::<false>(&history, latest.0, valid, null_mut(), &mut out, HISTORY_US + 2),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            assert!(out.is_null());
+            // The predecessor cannot advance when its successor is also expired,
+            // even though that successor remains available as the current reading.
+            assert_eq!(
+                adjacent_reading::<true>(&history, caller_ref, valid, null_mut(), &mut out, 2 * HISTORY_US + 2),
+                GAMEINPUT_E_REFERENCE_READING_TOO_OLD
+            );
+            assert!(out.is_null());
+            assert_eq!(reading_timestamp(caller_ref), 1);
+            let mut state = GamepadState::default();
+            assert!(reading_gamepad(caller_ref, &mut state));
+            assert_eq!(state.buttons, A);
+            reading_release(caller_ref);
+
+            assert_eq!(
+                adjacent_reading::<false>(&history, latest.0, valid, null_mut(), &mut out, 3 * HISTORY_US),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            assert!(out.is_null());
+        }
+        let stream = history.lock().unwrap();
+        assert_eq!(stream.readings.len(), 1);
+        assert_eq!(stream.readings.back().unwrap().0, latest.0);
     }
 
     #[test]
@@ -1131,7 +1446,7 @@ mod tests {
             assert_eq!(call_qi(d, &IID_IGAMEINPUT_DEVICE, std::ptr::null_mut()), E_POINTER);
 
             // IGameInputReading (refcounted)
-            let r = new_reading(GamepadState::default());
+            let r = OwnedReading::new(GamepadState::default(), 1, now_us()).into_raw();
             let rp = r as *mut c_void;
             out = sentinel;
             assert_eq!(call_qi(rp, &IID_IUNKNOWN, &mut out), S_OK);
@@ -1219,21 +1534,54 @@ mod tests {
 
     static READING_CB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    // These tests drive dispatch explicitly so no host input changes can
+    // invoke their callbacks or hold up their synchronization handshake.
+    fn track_test_reading_callback(context: *mut c_void, cb: ReadingCallback) -> u64 {
+        let token = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
+        track_reading_callback(token, context, cb, 0);
+        token
+    }
+
+    fn dispatch_test_reading(buttons: u32) {
+        let reading = OwnedReading::new(GamepadState { buttons, ..Default::default() }, 1, now_us());
+        dispatch_reading_callbacks(&reading, 0);
+    }
+
+    #[test]
+    fn callback_history_filters_old_readings_and_reports_overrun() {
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap();
+        unsafe extern "system" fn record_delivery(_token: u64, ctx: *mut c_void, _r: *mut Reading, overrun: bool) {
+            // SAFETY: the test keeps this counter alive until unregistering.
+            unsafe { &*ctx.cast::<AtomicU32>() }.store(if overrun { 2 } else { 1 }, Ordering::Relaxed);
+        }
+        let mut history = ReadingHistory::new();
+        let initial = record_test_reading(&mut history, 0, 1);
+        let sequence = history.sequence();
+        let delivered = AtomicU32::new(0);
+        let token = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
+        track_reading_callback(token, (&raw const delivered).cast_mut().cast(), record_delivery, sequence);
+        dispatch_reading_callbacks(&initial, 0);
+        let delivered_before = delivered.load(Ordering::Relaxed);
+
+        history.record(GamepadState { buttons: A, ..Default::default() }, 2);
+        let latest = record_test_reading(&mut history, 0, HISTORY_US + 3);
+        let recovered = history.next_after(sequence).unwrap();
+        dispatch_reading_callbacks(&recovered, sequence);
+        assert!(unsafe { unregister_callback(input(), token, 0) });
+        assert_eq!(delivered_before, 0, "pre-registration readings aren't dispatched");
+        assert_eq!(recovered.0, latest.0);
+        assert_eq!(delivered.load(Ordering::Relaxed), 2, "expired unread readings set overrun");
+    }
+
     #[test]
     fn unregister_reading_callback_waits_for_in_flight_and_prevents_uaf() {
         let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gate = Arc::new(CallbackGate::new());
         let g = input();
-        let mut token = 0u64;
-        unsafe {
-            assert_eq!(
-                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, Arc::as_ptr(&gate) as *mut c_void, Some(gated_reading_cb), &mut token),
-                S_OK
-            );
-        }
+        let token = track_test_reading_callback(Arc::as_ptr(&gate) as *mut c_void, gated_reading_cb);
 
         let dispatch_thread = std::thread::spawn(|| {
-            dispatch_reading_callbacks(GamepadState { buttons: A, ..Default::default() });
+            dispatch_test_reading(A);
         });
         gate.wait_entered();
 
@@ -1259,7 +1607,7 @@ mod tests {
 
         // Subsequent dispatches must never invoke the unregistered callback again.
         let calls_before = gate.calls.load(Ordering::Acquire);
-        dispatch_reading_callbacks(GamepadState { buttons: B, ..Default::default() });
+        dispatch_test_reading(B);
         assert_eq!(gate.calls.load(Ordering::Acquire), calls_before);
     }
 
@@ -1268,16 +1616,10 @@ mod tests {
         let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gate = Arc::new(CallbackGate::new());
         let g = input();
-        let mut token = 0u64;
-        unsafe {
-            assert_eq!(
-                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, Arc::as_ptr(&gate) as *mut c_void, Some(gated_reading_cb), &mut token),
-                S_OK
-            );
-        }
+        let token = track_test_reading_callback(Arc::as_ptr(&gate) as *mut c_void, gated_reading_cb);
 
         let dispatch_thread = std::thread::spawn(|| {
-            dispatch_reading_callbacks(GamepadState { buttons: X, ..Default::default() });
+            dispatch_test_reading(X);
         });
         gate.wait_entered();
 
@@ -1316,21 +1658,13 @@ mod tests {
             calls: AtomicU32::new(0),
             unreg_ok: std::sync::atomic::AtomicBool::new(false),
         });
-        let g = input();
-        let mut token = 0u64;
-        unsafe {
-            assert_eq!(
-                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, &*ctx as *const SelfCtx as *mut c_void, Some(self_unreg_cb), &mut token),
-                S_OK
-            );
-        }
-
-        dispatch_reading_callbacks(GamepadState { buttons: Y, ..Default::default() });
+        track_test_reading_callback(&*ctx as *const SelfCtx as *mut c_void, self_unreg_cb);
+        dispatch_test_reading(Y);
         assert_eq!(ctx.calls.load(Ordering::Acquire), 1);
         assert!(ctx.unreg_ok.load(Ordering::Acquire));
 
         // Must not fire again after self-unregister.
-        dispatch_reading_callbacks(GamepadState { buttons: MENU, ..Default::default() });
+        dispatch_test_reading(MENU);
         assert_eq!(ctx.calls.load(Ordering::Acquire), 1);
     }
 

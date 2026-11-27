@@ -359,7 +359,6 @@ fn transition_sub(r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, a
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use windows::Win32::Graphics::Dxgi::Common::*;
 
     fn image(format: u32, ty: ImageType, w: u32, h: u32, slices: u32, mips: u32, mode: u32, address: u64) -> Image {
@@ -659,24 +658,30 @@ mod tests {
         Some(sum as f64 / (sw * sh * ch) as f64)
     }
 
-    /// The retail TTPF archive (`XCL_SAMPLE_TTPF`): (1) the mip chain model gives the space
-    /// every texture takes; (2) on its uncompressed unorm textures each detiled mip level is
-    /// close to the level above it scaled down 2× (mip tail levels included), while the same
-    /// tail levels read from a wrong place in the tail block (origin 0, 0) are not.
+    /// Read and detile every entry in the archive. For applicable textures, also check mip
+    /// continuity, mip tail origins and volume layout against the texture content.
     #[test]
     fn retail_ttpf_textures_detile_with_their_mip_chains() {
         let Ok(path) = std::env::var("XCL_SAMPLE_TTPF") else {
             println!("XCL_SAMPLE_TTPF not set – skipping");
             return;
         };
-        let a = Ttpf::open(&path);
-        let (mut fit, mut sized, mut unreadable) = (0, 0, 0);
+        check_ttpf_textures(&Ttpf::open(&path));
+    }
+
+    fn check_ttpf_textures(a: &Ttpf) {
+        assert!(!a.textures.is_empty(), "empty TTPF texture table");
         let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
-        let (mut checked, mut close, mut worst) = (0, 0, Vec::new());
-        let (mut tail_levels, mut tail_err, mut wrong_err) = (0, 0.0f64, 0.0f64);
+        let (mut color_checked, mut color_close) = (0, 0);
+        let (mut alpha_checked, mut alpha_close) = (0, 0);
+        let mut worst = Vec::new();
+        let (mut tail_levels, mut tail_controls, mut tail_err, mut wrong_err) = (0, 0, 0.0f64, 0.0f64);
         let mut volumes = Vec::new();
+        let mut detiled = 0;
+        let mut subresource_count = 0;
         for t in &a.textures {
-            let Some((e, side, _)) = ttpf_element(t.dxgi) else { continue };
+            let (e, side, _) = ttpf_element(t.dxgi)
+                .unwrap_or_else(|| panic!("TTPF texture {}: unsupported DXGI format {}", t.index, t.dxgi));
             let gfx10 = match (e, side) {
                 (0, 1) => 1,
                 (1, 1) => 7,
@@ -692,20 +697,55 @@ mod tests {
                 _ => ImageType::D2,
             };
             let img = image(gfx10, ty, t.w, t.h, t.slices, t.mips, t.mode, 0);
-            let p = placement(&img, CONSOLE_PIPES).unwrap();
-            sized += 1;
-            if p.bytes == t.end - t.start || p.bytes.div_ceil(4096) * 4096 == t.end - t.start {
-                fit += 1;
+            let p = placement(&img, CONSOLE_PIPES)
+                .unwrap_or_else(|e| panic!("TTPF texture {}: {e}", t.index));
+            let start = a.payload_start(t, p.bytes);
+            let slot = t.end.checked_sub(start).expect("TTPF entry ends before its payload");
+            assert!(
+                p.bytes == slot || p.bytes.next_multiple_of(t.payload_alignment()) == slot,
+                "TTPF texture {}: layout needs {:#x} bytes, archive slot has {slot:#x}",
+                t.index, p.bytes
+            );
+            let mem = a.read(start, start + p.bytes)
+                .unwrap_or_else(|| panic!("TTPF texture {}: unreadable payload at {start:#x}", t.index));
+            let subs = subresources(&img, &mem, CONSOLE_PIPES)
+                .unwrap_or_else(|e| panic!("TTPF texture {}: {e}", t.index));
+            let layers = if t.dim == 3 { 1 } else { t.slices as usize };
+            assert_eq!(subs.len(), layers * t.mips as usize, "TTPF texture {}", t.index);
+            detiled += 1;
+            subresource_count += subs.len();
+            if t.has_cube_tiers() {
+                let first = a.blocks.binary_search_by_key(&t.start, |b| b.start)
+                    .expect("TTPF cube must start at a block boundary");
+                let full = a.blocks.binary_search_by_key(&start, |b| b.start).unwrap();
+                for tier in first..full {
+                    let shift = full - tier;
+                    assert!(shift < t.mips as usize, "TTPF cube {}: too many lower-resolution tiers", t.index);
+                    let lower = image(gfx10, ty, (t.w >> shift).max(1), (t.h >> shift).max(1),
+                        t.slices, t.mips - shift as u32, t.mode, 0);
+                    let prefix = a.read(a.blocks[tier].start, a.blocks[tier + 1].start)
+                        .unwrap_or_else(|| panic!("TTPF cube {}: unreadable lower-resolution tier", t.index));
+                    let lower = subresources(&lower, &prefix, CONSOLE_PIPES).unwrap();
+                    let full_mips = subs.chunks_exact(t.mips as usize).flat_map(|face| &face[shift..]);
+                    assert!(full_mips.eq(&lower), "TTPF cube {}: duplicated mips differ at tier {shift}", t.index);
+                }
             }
             // volumes of 16-bit float texels (colour-grading LUTs): neighbours along x and z
             // differ little read as thick blocks, a lot read as 2D slices
-            if t.dim == 3 && matches!(t.dxgi, 10 | 54) {
-                if let Some(mem) = a.read(t.start, t.end) {
-                    let thick = subresources(&img, &mem, CONSOLE_PIPES).unwrap().remove(0);
-                    let flat = image(gfx10, ImageType::D2Array, t.w, t.h, t.slices, t.mips, t.mode, 0);
-                    let as_2d: Vec<u8> = subresources(&flat, &mem, CONSOLE_PIPES).unwrap().into_iter().flat_map(|s| s.data).collect();
-                    let (w, h, d, e) = (t.w as usize, t.h as usize, t.slices as usize, 1usize << e);
-                    volumes.push((t.index, roughness(&thick.data, w, h, d, e), roughness(&as_2d, w, h, d, e)));
+            if t.dim == 3 && matches!(t.dxgi, 10 | 54) && t.w > 1 && t.slices > 1 {
+                let flat = image(gfx10, ImageType::D2Array, t.w, t.h, t.slices, t.mips, t.mode, 0);
+                if let Ok(flat_subs) = subresources(&flat, &mem, CONSOLE_PIPES) {
+                    // A D2 array stores all mips of one slice before the next slice.
+                    let as_2d: Vec<u8> = flat_subs.chunks_exact(t.mips as usize)
+                        .flat_map(|slice| slice[0].data.iter().copied()).collect();
+                    let thick = &subs[0].data;
+                    if as_2d.len() == thick.len() {
+                        let (w, h, d, e) = (t.w as usize, t.h as usize, t.slices as usize, 1usize << e);
+                        // `roughness` reads only the first half-float of each texel.
+                        let distinct = as_2d.chunks_exact(e).zip(thick.chunks_exact(e))
+                            .any(|(a, b)| a[..2] != b[..2]);
+                        volumes.push((t.index, roughness(thick, w, h, d, e), roughness(&as_2d, w, h, d, e), distinct));
+                    }
                 }
             }
             // unorm channels: R8 / A8, RGBA8 / BGRA8, RGBA16
@@ -718,11 +758,6 @@ mod tests {
             if t.mips < 2 || t.slices != 1 {
                 continue;
             }
-            let Some(mem) = a.read(t.start, t.start + p.bytes) else {
-                unreadable += 1;
-                continue;
-            };
-            let subs = subresources(&img, &mem, CONSOLE_PIPES).unwrap();
             let mut bad = 0.0f64;
             for k in 1..subs.len() {
                 let Some(err) = mip_error(&subs[k - 1], &subs[k], ch, cb) else { continue };
@@ -735,26 +770,106 @@ mod tests {
                     wrong.levels[k].origin = (0, 0);
                     let ws = Subresource { depth: 1, rows: l.height, row_bytes: subs[k].row_bytes, data: wrong.detile_level(&mem, k, 0) };
                     tail_levels += 1;
-                    tail_err += err;
-                    wrong_err += mip_error(&subs[k - 1], &ws, ch, cb).unwrap();
+                    // `mip_error` uses only the high byte of each 16-bit channel.
+                    let distinct = if cb == 1 { ws.data != subs[k].data } else {
+                        ws.data.chunks_exact(2).zip(subs[k].data.chunks_exact(2))
+                            .any(|(a, b)| a[1] != b[1])
+                    };
+                    if distinct {
+                        tail_controls += 1;
+                        tail_err += err;
+                        wrong_err += mip_error(&subs[k - 1], &ws, ch, cb).unwrap();
+                    }
                 }
             }
-            checked += 1;
+            // Alpha masks can change coverage between mips. Keep their box-filter error as
+            // a diagnostic; they still go through the same layout, decode and tail checks.
+            let (checked, close) = if t.dxgi == 65 {
+                (&mut alpha_checked, &mut alpha_close)
+            } else {
+                (&mut color_checked, &mut color_close)
+            };
+            *checked += 1;
             if bad < 8.0 {
-                close += 1;
+                *close += 1;
             } else if worst.len() < 8 {
                 worst.push((t.index, t.w, t.h, t.mips, t.mode, bad));
             }
         }
-        let n = tail_levels.max(1) as f64;
-        println!("TTPF: the mip chain model size matches for {fit} of {sized} textures");
-        println!("TTPF: textures with mips (R8/RGBA8/RGBA16): {close} of {checked} – every mip close to the previous one downscaled (< 8/255), {unreadable} in unreadable blocks; outliers: {worst:?}");
-        println!("TTPF: {tail_levels} levels in the mip tail – error {:.2}/255, at the wrong place in the block {:.2}/255", tail_err / n, wrong_err / n);
-        println!("TTPF: volumes (index, neighbour difference as thick blocks, as 2D slices): {volumes:?}");
-        assert!(fit * 100 >= sized * 99, "mip chain model: {fit} / {sized}");
-        assert!(checked >= 5 && close * 100 >= checked * 90, "mips: {close} / {checked}");
-        assert!(tail_levels >= 5 && wrong_err > 3.0 * tail_err, "mip tail: {tail_err} vs {wrong_err}");
-        assert!(!volumes.is_empty() && volumes.iter().all(|v| v.2 > 3.0 * v.1), "volumes: {volumes:?}");
+        let n = tail_controls.max(1) as f64;
+        println!("TTPF: read and detiled {detiled} of {} textures ({subresource_count} subresources)", a.textures.len());
+        println!("TTPF: mips close to the previous level downscaled (< 8/255): color {color_close}/{color_checked}, alpha {alpha_close}/{alpha_checked}; outliers: {worst:?}");
+        println!("TTPF: {tail_levels} levels in the mip tail, {tail_controls} distinguishable controls – error {:.2}/255, at the wrong place in the block {:.2}/255", tail_err / n, wrong_err / n);
+        println!("TTPF: volumes (index, neighbour difference as thick blocks, as 2D slices, distinguishable): {volumes:?}");
+        assert!(color_close * 100 >= color_checked * 90, "color mips: {color_close} / {color_checked}");
+        assert!(tail_controls == 0 || wrong_err > 3.0 * tail_err, "mip tail: {tail_err} vs {wrong_err}");
+        assert!(volumes.iter().all(|v| !v.3 || v.2 > 3.0 * v.1), "volumes: {volumes:?}");
+    }
+
+    fn ttpf_with_cleared_smallest_mip(dxgi: u32) -> Ttpf {
+        let img = image(1, ImageType::D2, 2, 2, 1, 2, 5, 0);
+        let p = placement(&img, CONSOLE_PIPES).unwrap();
+        let mut data = vec![0; p.bytes];
+        p.chain.tile_level(&mut data, 0, 0, &[64; 4]);
+        p.chain.tile_level(&mut data, 1, 0, &[0]);
+        let start = 0x800;
+        let end = start + data.len();
+        Ttpf {
+            blocks: vec![
+                TtpfBlock { file: 0, start, codec: 0, padding: 0 },
+                TtpfBlock { file: data.len(), start: end, codec: 0, padding: 0 },
+            ],
+            textures: vec![TtpfTexture {
+                index: 0, w: 2, h: 2, dxgi, mode: 5, mips: 2, slices: 1, dim: 1,
+                tile_mode: 1, start, end,
+            }],
+            d: data,
+            cache: Default::default(),
+        }
+    }
+
+    #[test]
+    fn ttpf_accepts_a_cleared_alpha_mip() {
+        check_ttpf_textures(&ttpf_with_cleared_smallest_mip(DXGI_FORMAT_A8_UNORM.0 as u32));
+    }
+
+    #[test]
+    #[should_panic(expected = "color mips: 0 / 1")]
+    fn ttpf_still_rejects_an_inconsistent_color_mip() {
+        check_ttpf_textures(&ttpf_with_cleared_smallest_mip(DXGI_FORMAT_R8_UNORM.0 as u32));
+    }
+
+    #[test]
+    fn ttpf_uniform_tail_needs_no_distinguishing_control() {
+        let img = image(1, ImageType::D2, 4, 4, 1, 2, 5, 0);
+        let p = placement(&img, CONSOLE_PIPES).unwrap();
+        assert_ne!(p.chain.levels[1].origin, (0, 0));
+        let start = 0x800;
+        let end = start + p.bytes;
+        let a = Ttpf {
+            blocks: vec![TtpfBlock { file: 0, start, codec: 0, padding: 0 }, TtpfBlock { file: p.bytes, start: end, codec: 0, padding: 0 }],
+            textures: vec![TtpfTexture { index: 0, w: 4, h: 4, dxgi: 61, mode: 5, mips: 2, slices: 1, dim: 1, tile_mode: 1, start, end }],
+            d: vec![0; p.bytes],
+            cache: Default::default(),
+        };
+        check_ttpf_textures(&a);
+    }
+
+    #[test]
+    fn ttpf_small_mipped_volume_does_not_require_a_flat_array_control() {
+        for mips in [1, 2] {
+            let img = image(7, ImageType::D3, 2, 2, 2, mips, 5, 0);
+            let p = placement(&img, CONSOLE_PIPES).unwrap();
+            let start = 0x800;
+            let end = start + p.bytes;
+            let a = Ttpf {
+                blocks: vec![TtpfBlock { file: 0, start, codec: 0, padding: 0 }, TtpfBlock { file: p.bytes, start: end, codec: 0, padding: 0 }],
+                textures: vec![TtpfTexture { index: 0, w: 2, h: 2, dxgi: 54, mode: 5, mips, slices: 2, dim: 3, tile_mode: 1, start, end }],
+                d: vec![0; p.bytes],
+                cache: Default::default(),
+            };
+            check_ttpf_textures(&a);
+        }
     }
 
     /// Mean |difference| between x and z neighbours of the first channel (half floats, `e`-byte
@@ -792,6 +907,46 @@ mod tests {
         })
     }
 
+    #[test]
+    fn ttpf_reads_tagged_blocks_and_the_last_texture() {
+        let mut file = vec![0; 0x1700];
+        file[..4].copy_from_slice(b"RDS5");
+        file[4..8].copy_from_slice(&4u32.to_le_bytes());
+        file[8..12].copy_from_slice(&0x12000u32.to_le_bytes());
+        file[16..20].copy_from_slice(&1u32.to_le_bytes());
+        file[0x100..0x104].copy_from_slice(b"ETPF");
+        file[0x108..0x10c].copy_from_slice(&2u32.to_le_bytes());
+        let cube = (2u32 << 24) | (2 << 21) | (5 << 10) | (98 << 3) | 2;
+        file[0x114..0x118].copy_from_slice(&cube.to_le_bytes());
+        file[0x120..0x124].copy_from_slice(&(2u32 << 28).to_le_bytes());
+        file[0x124..0x128].copy_from_slice(&((1u32 << 21) | (71 << 3) | 1).to_le_bytes());
+        file[0x128..0x12c].copy_from_slice(&2u32.to_le_bytes());
+
+        let raw = vec![0x78; 0x1000];
+        let zlib = miniz_oxide::deflate::compress_to_vec_zlib(&[0x35; 0x1000], 6);
+        let bc1 = include_bytes!("../../../../tests/data/bcpack/bc1-8192-3.bin");
+        for (i, (start, next, tagged, payload)) in [
+            (0x200, 0x1300, 0x0000, raw.as_slice()),
+            (0x1300, 0x1400, 0x1800, zlib.as_slice()),
+            (0x1400, 0x1700, 0x2100, bc1.as_slice()),
+            (0x1700, 0x1700, 0x12100, &[]),
+        ].into_iter().enumerate() {
+            let padding = next - start - payload.len();
+            let record = (start as u64 >> 8) | ((tagged as u64 >> 6) << 24) | (padding as u64) << 52;
+            file[0x18 + 8 * i..0x20 + 8 * i].copy_from_slice(&record.to_le_bytes());
+            file[start..start + payload.len()].copy_from_slice(payload);
+        }
+
+        let archive = Ttpf::parse(file);
+        assert_eq!(archive.payload_start(&archive.textures[0], 0x1000), 0x1800);
+        assert_eq!(archive.read(0x17fe, 0x1802).unwrap(), [0x78, 0x78, 0x35, 0x35]);
+        let last = &archive.textures[1];
+        assert_eq!((last.start, last.end, last.mips), (0x2800, 0x12800, 3));
+        assert_eq!(archive.read(last.start, last.end).unwrap(), crate::hle::bcpack::decode(1, bc1, 0x10000).unwrap());
+        assert!(archive.read(last.end, last.end + 1).is_none());
+        assert!(archive.read(last.end + 1, last.end).is_none(), "reversed range");
+    }
+
     struct TtpfTexture {
         index: usize,
         w: u32,
@@ -802,73 +957,131 @@ mod tests {
         slices: u32,
         /// dword 1 bits 21-23: 1 2D, 2 cube, 3 volume (slices = depth), 5 2D array
         dim: u32,
+        tile_mode: u32,
         start: usize,
         end: usize,
     }
 
-    /// Just enough of a .ttpf archive: its zlib blocks of one unpacked stream and the texture
-    /// table.
+    impl TtpfTexture {
+        fn has_cube_tiers(&self) -> bool {
+            self.dim == 2 && self.mips > 1 && self.tile_mode != 1
+        }
+
+        fn payload_alignment(&self) -> usize {
+            if self.has_cube_tiers() && self.tile_mode != 2 { 0x10000 } else { 0x1000 }
+        }
+    }
+
+    struct TtpfBlock {
+        file: usize,
+        start: usize,
+        codec: u8,
+        padding: usize,
+    }
+
+    /// The archive's texture table and the blocks of its unpacked stream, in stream order.
     struct Ttpf {
         d: Vec<u8>,
-        /// (file offset, position in the stream), by position
-        blocks: Vec<(usize, usize)>,
+        blocks: Vec<TtpfBlock>,
         textures: Vec<TtpfTexture>,
-        cache: std::cell::RefCell<HashMap<usize, Option<std::rc::Rc<Vec<u8>>>>>,
+        cache: std::cell::RefCell<Option<(usize, Vec<u8>)>>,
     }
 
     impl Ttpf {
         fn open(path: &str) -> Ttpf {
-            let d = std::fs::read(path).unwrap();
+            Self::parse(std::fs::read(path).unwrap())
+        }
+
+        fn parse(d: Vec<u8>) -> Ttpf {
             let u32_at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
             assert_eq!(&d[..4], b"RDS5");
-            let total = u32_at(8) as usize | (u32_at(0xc) as usize & 0xff) << 32;
+            // The header excludes the 0x800-byte lead-in used by stream offsets.
+            let total = (u32_at(8) as usize | (u32_at(0xc) as usize & 0xff) << 32) + 0x800;
             let at = (u32_at(0x10) as usize) << 8;
+            assert_eq!(&d[at..at + 4], b"ETPF");
             let n = (u32_at(4) as usize).min((at - 0x18) / 8);
-            let mut blocks: Vec<(usize, usize)> = (0..n)
+            let mut blocks: Vec<_> = (0..n)
                 .filter_map(|i| {
                     let v = u64::from_le_bytes(d[0x18 + 8 * i..0x20 + 8 * i].try_into().unwrap());
-                    let pos = ((v >> 24) & 0xff_ffff) | ((v >> 48) & 0xf) << 24;
-                    (v != 0).then_some((((v & 0xff_ffff) << 8) as usize, (pos << 6) as usize))
+                    // The low bits of the unpacked position carry the codec. The packed
+                    // payload stops before the padding recorded in the high bits.
+                    let tagged = (((v >> 24) & 0xfff_ffff) << 6) as usize;
+                    (v != 0).then_some(TtpfBlock {
+                        file: ((v & 0xff_ffff) << 8) as usize,
+                        start: (tagged & !0xfff) + 0x800,
+                        codec: ((tagged >> 8) & 0xf) as u8,
+                        padding: (v >> 52) as usize,
+                    })
                 })
                 .collect();
-            blocks.sort_by_key(|b| b.1);
+            blocks.sort_by_key(|b| b.start);
+            let sentinel = blocks.last().expect("empty TTPF block table");
+            assert_eq!((sentinel.file, sentinel.start), (d.len(), total), "TTPF end of stream");
+            assert!(blocks.windows(2).all(|w| w[0].file < w[1].file && w[0].start < w[1].start), "TTPF block order");
             let count = u32_at(at + 8) as usize;
             let mut textures: Vec<TtpfTexture> = (0..count)
                 .map(|i| {
                     let o = at + 16 + 16 * i;
                     let (a, b, c) = (u32_at(o), u32_at(o + 4), u32_at(o + 8));
+                    let tile_mode = (b >> 24) & 3;
+                    // dword 0 bits 28-31 plus dword 1 bits 0-2 (#1245).
+                    let mips = ((a >> 28) + (b & 7)).max(1);
+                    let dim = (b >> 21) & 7;
                     TtpfTexture {
                         index: i,
                         w: (a & 0x3fff) + 1,
                         h: ((a >> 14) & 0x3fff) + 1,
                         dxgi: (b & 0x3ff) >> 3,
-                        // tile mode bits: 0 = 64 KB tiles (SW_64KB_D), else 4 KB (SW_4KB_S)
-                        mode: if (b >> 24) & 3 == 0 { 10 } else { 5 },
-                        mips: (a >> 28).max(1),
+                        // Mode 0 uses SW_64KB_D except for cubes with separate mip tiers.
+                        mode: if tile_mode == 0 && !(dim == 2 && mips > 1) { 10 } else { 5 },
+                        mips,
                         slices: ((b >> 10) & 0x7ff) + 1,
-                        dim: (b >> 21) & 7,
+                        dim,
+                        tile_mode,
                         start: (c & 0x1f_ffff) as usize * 4096 + 0x800,
                         end: total,
                     }
                 })
                 .collect();
-            let mut by_start: Vec<usize> = (0..count).collect();
-            by_start.sort_by_key(|&i| textures[i].start);
+            textures.sort_by_key(|t| t.start);
             for k in 0..count.saturating_sub(1) {
-                textures[by_start[k]].end = textures[by_start[k + 1]].start;
+                textures[k].end = textures[k + 1].start;
             }
             Ttpf { d, blocks, textures, cache: Default::default() }
         }
 
-        /// bytes [a, b) of the unpacked stream (None: in a block that is not zlib)
+        fn payload_start(&self, texture: &TtpfTexture, bytes: usize) -> usize {
+            if !texture.has_cube_tiers() {
+                return texture.start;
+            }
+            // Lower-resolution cubes come first. The full six-face chain starts in its
+            // own block and, for modes 0 and 3, is padded out to a 64 KiB multiple.
+            let start = texture.end.checked_sub(bytes.next_multiple_of(texture.payload_alignment()))
+                .filter(|&start| start > texture.start)
+                .unwrap_or_else(|| panic!("TTPF cube {}: no room for its full mip chain", texture.index));
+            assert!(self.blocks.binary_search_by_key(&start, |b| b.start).is_ok(),
+                "TTPF cube {}: full mip chain must start at a block boundary", texture.index);
+            start
+        }
+
+        /// Bytes [a, b) of the unpacked stream. The cache retains the last block for the next
+        /// texture if they share a block.
         fn read(&self, a: usize, b: usize) -> Option<Vec<u8>> {
-            let mut out = Vec::with_capacity(b - a);
+            let len = b.checked_sub(a)?;
+            if b > self.blocks.last()?.start {
+                return None;
+            }
+            let mut out = Vec::with_capacity(len);
             let mut pos = a;
             while pos < b {
-                let i = self.blocks.partition_point(|bl| bl.1 <= pos).checked_sub(1)?;
-                let data = self.block(i)?;
-                let from = pos - self.blocks[i].1;
-                let to = (b - self.blocks[i].1).min(data.len());
+                let i = self.blocks.partition_point(|bl| bl.start <= pos).checked_sub(1)?;
+                let mut cache = self.cache.borrow_mut();
+                if cache.as_ref().is_none_or(|(index, _)| *index != i) {
+                    *cache = Some((i, self.block(i)?));
+                }
+                let data = &cache.as_ref()?.1;
+                let from = pos.checked_sub(self.blocks[i].start)?;
+                let to = b.checked_sub(self.blocks[i].start)?.min(data.len());
                 if to <= from {
                     return None;
                 }
@@ -878,17 +1091,17 @@ mod tests {
             Some(out)
         }
 
-        fn block(&self, i: usize) -> Option<std::rc::Rc<Vec<u8>>> {
-            self.cache
-                .borrow_mut()
-                .entry(i)
-                .or_insert_with(|| {
-                    let off = self.blocks[i].0;
-                    let next = self.blocks.iter().map(|b| b.0).filter(|&o| o > off).min().unwrap_or(self.d.len());
-                    let src = self.d.get(off..next)?;
-                    (src.first() == Some(&0x78)).then(|| miniz_oxide::inflate::decompress_to_vec_zlib(src).ok().map(std::rc::Rc::new)).flatten()
-                })
-                .clone()
+        fn block(&self, i: usize) -> Option<Vec<u8>> {
+            let block = &self.blocks[i];
+            let next = self.blocks.get(i + 1)?;
+            let len = next.start.checked_sub(block.start)?;
+            let src = self.d.get(block.file..next.file.checked_sub(block.padding)?)?;
+            let data = match block.codec {
+                0 => src.to_vec(),
+                8 => miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(src, len).ok()?,
+                mode => crate::hle::bcpack::decode(mode, src, len).ok()?,
+            };
+            (data.len() == len).then_some(data)
         }
     }
 }

@@ -45,9 +45,7 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
         (!root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir()) {
         return Ok(());
     }
-    // `XCL_PREPARE=0`: the title starts at once and builds what it uses as it goes (it stands
-    // still for those builds): for a look at a change without the wait
-    if std::env::var("XCL_PREPARE").is_ok_and(|v| v.trim() == "0") {
+    if left_out(std::env::var("XCL_PREPARE").ok().as_deref()) {
         crate::xlog_info!("Shader preparation left out (XCL_PREPARE=0): the title builds what it uses as it goes");
         return Ok(());
     }
@@ -225,9 +223,22 @@ fn percent(done: usize, total: usize, ready: bool) -> usize {
     if ready { 100 } else { done.saturating_mul(100).checked_div(total).unwrap_or(0).min(99) }
 }
 
+/// `XCL_PREPARE=0` (`value`): the title starts at once and builds what it uses as it goes,
+/// standing still for those builds, as before the preparation (the switch nvidia-dev has).
+fn left_out(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "0")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only `XCL_PREPARE=0` leaves the preparation out; unset or any other value prepares.
+    #[test]
+    fn only_xcl_prepare_0_leaves_the_preparation_out() {
+        assert!(left_out(Some("0")) && left_out(Some(" 0 ")));
+        assert!(!left_out(None) && !left_out(Some("1")) && !left_out(Some("")) && !left_out(Some("no")));
+    }
 
     #[test]
     fn clock_advances_during_a_stall_and_remembers_recovery() {
