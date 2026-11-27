@@ -448,6 +448,15 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     let n = code_bytes_at(rip, 16);
     let code = std::slice::from_raw_parts(rip as *const u8, n);
     let Some((what, len)) = crate::insn::decode(code) else {
+        // (local) a jump where the instruction trapped: another thread rewrote this CLZERO loop
+        // to its stub (`patch_clzero_loop`) after this one trapped in it – the jump runs now
+        if matches!(code.first(), Some(0xE9 | 0xEB)) {
+            return -1;
+        }
+        // … or another thread rewrote this MONITORX / MWAITX to its NOP after this one trapped
+        if is_patched_monitor_wait(code) {
+            return -1;
+        }
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
         return 0;
     };
@@ -474,9 +483,17 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
             }
         }
-        ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => {
-            std::hint::spin_loop();
+        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
+            // Rewritten in place at the first trap: `0F 01 FA/FB` -> `0F 1F FA/FB`, a NOP. One byte
+            // changes, so another thread runs either instruction, never a mix of them; the title's
+            // wait loop around them polls its memory itself. A retail title's loop trapped ~6,000
+            // times a second, a core's worth of exception handling under Wine.
+            // `XCL_MWAITX_PATCH=0`: emulated at every pass, as before.
+            static PATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let patch = *PATCH.get_or_init(|| std::env::var("XCL_MWAITX_PATCH").map_or(true, |v| v.trim() != "0"));
+            if !(patch && patch_byte(rip + len - 2, 0x01, 0x1F)) && what == ConsoleOnly::Mwaitx {
+                std::hint::spin_loop();
+            }
         }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
@@ -490,6 +507,12 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             }
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
+            if len == 12 {
+                if let Some(stub) = patch_clzero_loop(rip, end_reg) {
+                    ctx.Rip = stub as u64;
+                    return -1; // EXCEPTION_CONTINUE_EXECUTION: the stub runs the loop
+                }
+            }
             let regs: [&u64; 16] = [
                 &ctx.Rax, &ctx.Rcx, &ctx.Rdx, &ctx.Rbx, &ctx.Rsp, &ctx.Rbp, &ctx.Rsi, &ctx.Rdi,
                 &ctx.R8, &ctx.R9, &ctx.R10, &ctx.R11, &ctx.R12, &ctx.R13, &ctx.R14, &ctx.R15,
@@ -562,6 +585,157 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     }
     ctx.Rip += step as u64;
     -1 // EXCEPTION_CONTINUE_EXECUTION
+}
+
+/// (local) A title's CLZERO loop (`clzero; add rax,0x40; cmp rax,r; jb`, 12 bytes, after the 10-byte
+/// NOP compilers pad loops with) is rewritten once to jump to a stub that zeroes the same lines with
+/// plain stores: on a CPU without CLZERO each run of the loop was an illegal-instruction exception
+/// (slow under Wine), and a retail game runs such loops thousands of times a second.
+/// `XCL_CLZERO_PATCH=0`: emulated at every run, as before. The stub (58 bytes):
+/// `push rcx; push rdi; xor ecx,ecx; L: mov rdi,rax; and rdi,-64; mov [rdi+0..56],rcx (8×);
+/// add rax,0x40; cmp rax,r (the title's own bytes); jb L; pop rdi; pop rcx; jmp <after the loop>`.
+/// The loop's first 4 bytes become `jmp short` to the pad, whose last 8 bytes become `jmp` to the stub.
+/// `code` starts with a MONITORX / MWAITX that `patch_byte` turned into its NOP (`0F 1F FA/FB`
+/// after any prefixes).
+fn is_patched_monitor_wait(code: &[u8]) -> bool {
+    let i = code.iter().position(|&b| !matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF2 | 0xF3 | 0x40..=0x4F)).unwrap_or(code.len());
+    matches!(code.get(i..i + 3), Some([0x0F, 0x1F, 0xFA | 0xFB]))
+}
+
+/// The code byte at `at` changed from `from` to `to` (one atomic store; the page writable for it):
+/// whether it holds `to` now.
+unsafe fn patch_byte(at: usize, from: u8, to: u8) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut old = 0u32;
+    if VirtualProtect(at as *const std::ffi::c_void, 1, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        return false;
+    }
+    let byte = &*(at as *const std::sync::atomic::AtomicU8);
+    let done = match byte.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(now) => now == to,
+    };
+    VirtualProtect(at as *const std::ffi::c_void, 1, old, &mut old);
+    FlushInstructionCache(GetCurrentProcess(), at as *const std::ffi::c_void, 1);
+    done
+}
+
+unsafe fn patch_clzero_loop(rip: usize, end_reg: u8) -> Option<usize> {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // `cs nopw 0(rax,rax,1)`, its two prefixes in either order (compilers emit 66 2E)
+    const PAD: [u8; 8] = [0x0F, 0x1F, 0x84, 0, 0, 0, 0, 0];
+    const STUB: usize = 58;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_CLZERO_PATCH").map_or(true, |v| v.trim() != "0")) {
+        return None;
+    }
+    let why = |w: &str| {
+        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        if let Ok(mut s) = SEEN.lock() {
+            if !s.iter().any(|x| x == w) {
+                s.push(w.to_string());
+                crate::xlog_info!("CLZERO loop in {} not rewritten: {w} (logged once per reason)", modules::describe_address(rip));
+            }
+        }
+        None
+    };
+    // (the stub uses rcx and rdi; rax is the pointer; rsp is not an end)
+    if matches!(end_reg, 0 | 1 | 4 | 7) {
+        return why("its end register is one the stub uses");
+    }
+    if rip % 8 != 0 {
+        return why("not 8-byte aligned");
+    }
+    if code_bytes_at(rip - 10, 22) < 22 {
+        return why("its bytes are not all readable");
+    }
+    // stubs: executable memory within ±2 GB of the title's code, taken in turns
+    static AT: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+    let mut g = AT.lock().ok()?;
+    // (another thread that trapped in this loop rewrote it while this one waited: its stub)
+    let now = std::slice::from_raw_parts(rip as *const u8, 5);
+    if now[0] == 0xE9 {
+        return Some((rip as i64 + 5 + i32::from_le_bytes([now[1], now[2], now[3], now[4]]) as i64) as usize);
+    }
+    if now[..3] != [0x0F, 0x01, 0xFC] {
+        return None;
+    }
+    let pad = std::slice::from_raw_parts((rip - 10) as *const u8, 10);
+    // No pad before it (a branch ends right there): the loop's own first 8 bytes become the jump.
+    // That is one store too: no thread is inside the loop, each entry trapped at its first
+    // instruction and the handler ran the whole loop.
+    let in_place = !(matches!(pad[..2], [0x66, 0x2E] | [0x2E, 0x66]) && pad[2..] == PAD);
+    if g.1 - g.0 < STUB || g.0.abs_diff(rip) > 0x7000_0000 {
+        // the first free 64 KiB within ±1.75 GB, below the title's image first (above it lie
+        // the title's memory reservations), then above
+        let mut got = 0usize;
+        let base = rip & !0xFFFF;
+        for k in 1..(0x7000_0000usize >> 16) {
+            for at in [base.checked_sub(k << 16), base.checked_add(k << 16)].into_iter().flatten() {
+                let p = VirtualAlloc(at as *const _, 1 << 16, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
+                if p != 0 {
+                    got = p;
+                    break;
+                }
+            }
+            if got != 0 {
+                break;
+            }
+        }
+        if got == 0 {
+            return why("no free memory within ±1.75 GB for the stub");
+        }
+        *g = (got, got + (1 << 16));
+    }
+    let stub = g.0;
+    g.0 += 64;
+    let after = rip + 12;
+    let mut b: Vec<u8> = vec![0x51, 0x57, 0x31, 0xC9, 0x48, 0x89, 0xC7, 0x48, 0x83, 0xE7, 0xC0, 0x48, 0x89, 0x0F];
+    for k in (8u8..64).step_by(8) {
+        b.extend_from_slice(&[0x48, 0x89, 0x4F, k]);
+    }
+    b.extend_from_slice(&[0x48, 0x83, 0xC0, 0x40]);
+    b.extend_from_slice(std::slice::from_raw_parts((rip + 7) as *const u8, 3));
+    b.extend_from_slice(&[0x72, 0xD1, 0x5F, 0x59, 0xE9]);
+    let Ok(back) = i32::try_from(after as i64 - (stub + STUB) as i64) else { return why("stub too far") };
+    b.extend_from_slice(&back.to_le_bytes());
+    debug_assert_eq!(b.len(), STUB);
+    std::ptr::copy_nonoverlapping(b.as_ptr(), stub as *mut u8, STUB);
+    FlushInstructionCache(GetCurrentProcess(), stub as *const _, STUB);
+    let mut old = 0u32;
+    if VirtualProtect((rip - 10) as *const _, 22, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        return why("its code cannot be made writable");
+    }
+    if in_place {
+        let r = i32::try_from(stub as i64 - (rip + 5) as i64).ok()?.to_le_bytes();
+        let jmp = u64::from_le_bytes([0xE9, r[0], r[1], r[2], r[3], 0x90, 0x90, 0x90]);
+        (*(rip as *const std::sync::atomic::AtomicU64)).store(jmp, std::sync::atomic::Ordering::SeqCst);
+        VirtualProtect((rip - 10) as *const _, 22, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), rip as *const _, 12);
+        crate::xlog_info!("CLZERO loop in {} rewritten in place to a stub at {stub:#x} (no pad before it)", modules::describe_address(rip));
+        return Some(stub);
+    }
+    let to_stub = i32::try_from(stub as i64 - (rip - 8 + 5) as i64).ok()?;
+    // aligned stores, each leaving code a thread can run: the pad's first two bytes become NOPs
+    // (the rest is still `nopl 0(rax,rax)`), then its last 8 `jmp stub; nop×3`, then the loop's
+    // first 4 bytes `jmp short` to that jump
+    (*((rip - 10) as *const std::sync::atomic::AtomicU16)).store(0x9090, std::sync::atomic::Ordering::SeqCst);
+    let r = to_stub.to_le_bytes();
+    let jmp = u64::from_le_bytes([0xE9, r[0], r[1], r[2], r[3], 0x90, 0x90, 0x90]);
+    (*((rip - 8) as *const std::sync::atomic::AtomicU64)).store(jmp, std::sync::atomic::Ordering::SeqCst);
+    let head = u32::from_le_bytes([0xEB, 0xF6, 0x90, *((rip + 3) as *const u8)]);
+    (*(rip as *const std::sync::atomic::AtomicU32)).store(head, std::sync::atomic::Ordering::SeqCst);
+    VirtualProtect((rip - 10) as *const _, 22, old, &mut old);
+    FlushInstructionCache(GetCurrentProcess(), (rip - 10) as *const _, 14);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        crate::xlog_info!("CLZERO loop in {} rewritten to a stub at {stub:#x} (no exception per run)", modules::describe_address(rip));
+    }
+    Some(stub)
 }
 
 unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -1186,6 +1360,41 @@ mod tests {
                 assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
             }
         }
+        modules::unregister_mapped(code);
+    }
+
+    /// MONITORX / MWAITX become NOPs at their first trap (one byte each), and a thread that
+    /// trapped before the rewrite runs the NOP again.
+    #[test]
+    fn monitorx_and_mwaitx_are_rewritten_to_nops_at_the_first_trap() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        let code = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+        assert_ne!(code, 0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "mwaitx_test.exe".into(), path: "mwaitx_test.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        unsafe {
+            // monitorx; mwaitx; a prefixed mwaitx
+            let bytes = [0x0Fu8, 0x01, 0xFA, 0x0F, 0x01, 0xFB, 0x66, 0x0F, 0x01, 0xFB];
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), code as *mut u8, bytes.len());
+            for (at, len) in [(0usize, 3u64), (3, 3), (6, 4)] {
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                ctx.Rip = (code + at) as u64;
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, (code + at) as u64 + len, "stepped over");
+            }
+            let now = std::slice::from_raw_parts(code as *const u8, bytes.len());
+            assert_eq!(now, &[0x0F, 0x1F, 0xFA, 0x0F, 0x1F, 0xFB, 0x66, 0x0F, 0x1F, 0xFB]);
+            // a thread that trapped at the old bytes and is handled after the rewrite: run again
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = (code + 6) as u64;
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, (code + 6) as u64, "the NOP runs");
+        }
+        assert!(!is_patched_monitor_wait(&[0x0F, 0x1F, 0x00]) && is_patched_monitor_wait(&[0xF3, 0x0F, 0x1F, 0xFA]));
         modules::unregister_mapped(code);
     }
 
