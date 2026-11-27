@@ -805,9 +805,14 @@ fn keep_spare_pools() -> usize {
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
-    /// signalled after each mapping; title queues wait for it before their next work
+    /// signalled before a title queue's next work when mappings were made since (`before_execute`);
+    /// title queues wait for it. (A signal after each mapping split vkd3d-proton's sparse-bind
+    /// batches: one vkQueueBindSparse per texture, ~0.4 ms each on NVIDIA, the queues full while a
+    /// title streamed.)
     fence: ID3D12Fence,
     value: u64,
+    /// mappings made since the last signal
+    unsignalled: bool,
     /// per-device timestamp of the last periodic reclaim check
     last_reclaim: std::time::Instant,
     /// pool heaps by `Tile` index (a reclaimed one's slot is empty, as `TilePool::live` has it)
@@ -854,12 +859,13 @@ impl Pages {
         }
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
         let _ = queue.SetName(windows::core::w!("xcl vram tile-mapping queue"));
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        let fence: ID3D12Fence = super::real::create_raw_fence(&dev).ok()?;
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         Some(Pages {
             queue,
             fence,
             value: 0,
+            unsignalled: false,
             last_reclaim: std::time::Instant::now(),
             pools: PoolHeaps::new(),
             pool: TilePool::new(),
@@ -951,8 +957,19 @@ impl Pages {
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
-        self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        self.mappings_changed();
+    }
+
+    /// Tile mappings were queued: the fence is signalled once before the next GPU work
+    /// (`before_execute`). (local experiment) `XCL_PAGE_SIGNAL_EACH=1`: after each one, as before.
+    unsafe fn mappings_changed(&mut self) {
+        static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *EACH.get_or_init(|| std::env::var("XCL_PAGE_SIGNAL_EACH").is_ok_and(|v| v.trim() == "1")) {
+            self.value += 1;
+            let _ = self.queue.Signal(&self.fence, self.value);
+        } else {
+            self.unsignalled = true;
+        }
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -983,8 +1000,7 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
-        self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        self.mappings_changed();
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -1675,8 +1691,17 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
+            if pages.unsignalled {
+                pages.unsignalled = false;
+                pages.value += 1;
+                let _ = pages.queue.Signal(&pages.fence, pages.value);
+            }
+            // (local experiment) `XCL_PAGE_NO_WAIT=1`: no queue waits for the mappings (unsafe: uploads
+            // may land in tiles not mapped yet) – how fast the title runs without that wait
+            static NO_WAIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let no_wait = *NO_WAIT.get_or_init(|| std::env::var("XCL_PAGE_NO_WAIT").is_ok_and(|v| v.trim() == "1"));
             let key = queue.as_raw() as usize;
-            if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
+            if !no_wait && pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
                 let _ = queue.Wait(&pages.fence, pages.value);
                 super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
                 pages.waited.insert(key, pages.value);
