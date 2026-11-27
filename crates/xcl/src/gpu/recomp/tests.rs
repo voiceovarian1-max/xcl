@@ -11220,3 +11220,190 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+// (upstream PRs #2146 / #2158 by grahamster2: the LDS block sized from LDS_SIZE)
+/// The LDS block's size against time: the `bench_split_wave64` loop with an LDS store and
+/// load and a v_readfirstlane per iteration, LDS_SIZE unknown (the 32 KB block) and 512
+/// bytes (a block of 1 KB), wave32 and wave64 (the split form on a 32-lane GPU).
+#[test]
+#[ignore]
+fn bench_compute_lds_block() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    let l: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 10), ("SSRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 2), ("SRC0", V)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 4), ("SRC0", 128)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 8), ("SRC0", 130), ("VSRC1", 0)], None),
+        // loop: an LCG step, a store and a load of the LDS, an exchange
+        ("V_MUL_LO_U32", "ENC_VOP3", vec![("VDST", 2), ("SRC0", V + 2), ("SRC1", 255)], Some(1_103_515_245)),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 2), ("SRC0", 255), ("VSRC1", 2)], Some(12345)),
+        ("DS_WRITE_B32", "ENC_DS", vec![("ADDR", 8), ("DATA0", 2)], None),
+        ("DS_READ_B32", "ENC_DS", vec![("VDST", 9), ("ADDR", 8)], None),
+        ("V_XOR_B32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", V + 9), ("VSRC1", 4)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", V + 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 11), ("VSRC1", 4)], None),
+        ("S_ADD_U32", "ENC_SOP2", vec![("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", vec![("SSRC0", 10), ("SSRC1", 1)], None),
+        // → the loop start: 56 bytes of loop body before the branch
+        ("S_CBRANCH_SCC1", "ENC_SOPP", vec![("SIMM16", 0xFFF1)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 6), ("SRC0", 0), ("VSRC1", 6)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", vec![("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = l.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let p = prog(&refs);
+    let iterations = 8192u32;
+    println!("GPU: {} ({} lanes per wave at most)", runner::adapter().unwrap(), if runner::wave64_supported() == Ok(true) { 64 } else { 32 });
+    for threads in [64u32, 256] {
+        for wave64 in [false, true] {
+            let mut ms = Vec::new();
+            for lds_bytes in [0u32, 512.max(threads * 4)] {
+                let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, lds_bytes };
+                let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
+                let t = translate(&p, &opt).unwrap();
+                assert!(t.complete(), "{:?}", t.unsupported_why);
+                let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
+                let mut io = vec![0u32; 128];
+                io[1] = iterations;
+                let mem = vec![0u32; threads as usize];
+                let mut t = runner::dispatch_timed(&dxil, [(1u32 << 18) / threads, 1, 1], &io, &mem, 7).unwrap();
+                t.sort_by(f64::total_cmp);
+                ms.push(t[t.len() / 2]);
+            }
+            let form = if !wave64 { "wave32" } else if runner::split_wave64() { "wave64 (split)" } else { "wave64" };
+            let backend = if runner::direct_dxil() { "direct DXIL" } else { "HLSL" };
+            println!("{backend}, {form}, {threads} threads per group, 2^18 threads x {iterations} iterations: 32 KB block {:.1} ms, LDS_SIZE block {:.1} ms = {:.2}x", ms[0], ms[1], ms[0] / ms[1]);
+        }
+    }
+}
+
+/// A compute program's LDS block: thread k (v0, or v0 + 8 · v1 in an 8-wide 2-D group)
+/// stores k + 7 at byte `base` + 4k, s_barrier, loads the dword of thread (k + 1) mod n, adds
+/// its wave's first lane (v_readfirstlane: an exchange of the split form) and stores the sum
+/// at dword k of the memory.
+fn lds_ring_program(n: u32, base: u32, two_d: bool) -> Vec<u8> {
+    let mut l: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+    if two_d {
+        l.push(("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 5), ("SRC0", 131), ("VSRC1", 1)], None));
+        l.push(("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 0), ("SRC0", V + 5), ("VSRC1", 0)], None));
+    }
+    l.extend([
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 8), ("SRC0", 255), ("VSRC1", 1)], Some(base)),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 2), ("SRC0", 135), ("VSRC1", 0)], None),
+        ("DS_WRITE_B32", "ENC_DS", vec![("ADDR", 8), ("DATA0", 2)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 3), ("SRC0", 129), ("VSRC1", 0)], None),
+        ("V_AND_B32", "ENC_VOP2", vec![("VDST", 3), ("SRC0", 255), ("VSRC1", 3)], Some(n - 1)),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 3), ("SRC0", 130), ("VSRC1", 3)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 3), ("SRC0", 255), ("VSRC1", 3)], Some(base)),
+        ("DS_READ_B32", "ENC_DS", vec![("VDST", 4), ("ADDR", 3)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 4), ("SRC0", V + 4)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 4), ("VSRC1", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", vec![("ADDR", 1), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = l.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    prog(&refs)
+}
+
+/// The words in `#define <name> ...xcl_lds[<n>u` / `#define <name> <n>u` of a translation.
+fn hlsl_define_number(hlsl: &str, name: &str) -> Option<u32> {
+    let line = hlsl.lines().find(|l| l.starts_with(&format!("#define {name} ")))?;
+    let digits: String = line[name.len() + 8..].chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// `xcl_lds` is the size the console gave the program (COMPUTE_PGM_RSRC2.LDS_SIZE) plus the
+/// runtime words at its top, rounded up to a power of two – not always the 32 KB limit, which
+/// caps the groups an SM holds (3 per NVIDIA Ampere SM) – and 32 KB when the size is unknown.
+#[test]
+fn compute_lds_block_takes_the_programs_lds_size() {
+    let p = lds_ring_program(64, 0, false);
+    for (lds_bytes, wave64, split, words) in [
+        (512u32, false, false, 256u32),
+        (512, true, true, 256),
+        (512, true, false, 256),
+        (1024, true, true, 512),
+        (0, false, false, 8192),
+        (0, true, true, 8192),
+        (32768, true, true, 8192),
+    ] {
+        let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, lds_bytes };
+        let t = translate(&p, &Options { mode: Mode::Compute(cs), wave64, split_wave64: split, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let what = format!("LDS_SIZE {lds_bytes}, wave64 {wave64}, split {split}");
+        assert!(t.hlsl.contains(&format!("groupshared uint xcl_lds[{words}];")), "{what}:\n{}", t.hlsl);
+        assert_eq!(hlsl_define_number(&t.hlsl, "XCL_LDS_MASK"), Some(words - 1), "{what}");
+        // the program's own words stay below the runtime's
+        let need = lds_bytes.div_ceil(4).min(8000);
+        if wave64 && split {
+            let top = hlsl_define_number(&t.hlsl, "XCL_X_LDS_TOP").unwrap();
+            let xs = hlsl_define_number(&t.hlsl, "XCL_XS(i)").unwrap();
+            assert!(top + 1 >= need && xs > top, "{what}: top {top}, exchange {xs}");
+            assert_eq!(hlsl_define_number(&t.hlsl, "XCL_XW"), Some(words - 1), "{what}");
+        }
+    }
+}
+
+/// The program's LDS words and the runtime's in the top of a block sized from LDS_SIZE (the
+/// split-wave64 exchange, the safe barrier's words, the 2-D thread hand-out) do not overlap:
+/// with the largest LDS_SIZE that still gets the smallest block, and the program's words at
+/// its very end, a ring through the LDS of one / four console waves (1-D, and an 8 x 8 group)
+/// with an exchange after it gives every thread its neighbour's value – in the HLSL kernel
+/// and in the direct DXIL one, whose block (one exchange word per half here) is the HLSL's.
+#[test]
+fn gpu_compute_lds_ring_in_a_block_of_the_programs_size() {
+    if !gpu_ready() {
+        return;
+    }
+    for (dims, wave64) in [([64u32, 1, 1], true), ([64, 1, 1], false), ([256, 1, 1], true), ([256, 1, 1], false), ([8, 8, 1], false), ([8, 8, 1], true)] {
+        let threads = dims.iter().product::<u32>();
+        let two_d = dims[1] > 1;
+        let lanes = if wave64 { 64 } else { 32 };
+        let opt_for = |lds_bytes: u32| {
+            let cs = super::CsInterface { threads: dims, user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: if two_d { 2 } else { 1 }, lds_bytes };
+            on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })
+        };
+        let block = |lds_bytes: u32| {
+            let t = translate(&lds_ring_program(threads, lds_bytes - 4 * threads, two_d), &opt_for(lds_bytes)).unwrap();
+            hlsl_define_number(&t.hlsl, "XCL_LDS_MASK").unwrap() + 1
+        };
+        let smallest = block(4 * threads);
+        assert!(smallest < 8192, "{dims:?}: the block keeps the 32 KB size");
+        let mut lds_bytes = 4 * threads;
+        while block(lds_bytes + 4) == smallest {
+            lds_bytes += 4;
+        }
+        let p = lds_ring_program(threads, lds_bytes - 4 * threads, two_d);
+        let t = translate(&p, &opt_for(lds_bytes)).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        // the direct DXIL translator sizes and lays out its block as the HLSL kernel does
+        let opt = opt_for(lds_bytes);
+        let Mode::Compute(cs) = &opt.mode else { unreachable!() };
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && runner::split_wave64(), mem_windows: opt.mem_windows, sampler_base: 0 };
+        let mut forms = vec![("HLSL", hlsl)];
+        // the direct kernels `direct_or` runs: wave32, and wave64 in the split form
+        if !wave64 || runner::split_wave64() {
+            let direct = crate::gpu::dxil::kernel::translate_compute(&p, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil;
+            let dis = crate::gpu::dxil::validate::disassemble(&direct).unwrap();
+            let decl = dis.lines().find(|l| l.contains("@xcl_lds = ")).unwrap_or_else(|| panic!("{dims:?}: no xcl_lds in the direct DXIL"));
+            assert!(decl.contains(&format!("[{smallest} x i32]")), "{dims:?}: the direct DXIL block is not the HLSL block's {smallest} words: {decl}");
+            forms.push(("direct DXIL", direct));
+        }
+        for (form, dxil) in forms {
+            let mem = runner::dispatch(&dxil, [1, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
+            for (k, &got) in mem.iter().take(threads as usize).enumerate() {
+                let k = k as u32;
+                let first = k / lanes * lanes;
+                let want = ((k + 1) % threads + 7) + ((first + 1) % threads + 7);
+                assert_eq!(got, want, "{form}, {dims:?} threads, wave{lanes}: thread {k}");
+            }
+        }
+    }
+}

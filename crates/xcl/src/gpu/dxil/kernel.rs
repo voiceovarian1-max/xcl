@@ -689,6 +689,7 @@ impl Lw {
             live_exec: None,
             xslot: 1,
             lds: None,
+            lds_words: 8192,
             lds_top: 8191,
             dpp_enable: None,
             partner: Partner::Present,
@@ -765,26 +766,20 @@ impl Lw {
                 _ => Partner::Spin,
             };
         }
-        // The LDS array sized to what the program allocates (RSRC2 LDS_SIZE), not the whole 32 KB:
-        // groups that ask for little LDS fit many to a GPU core (a retail game's busiest program
-        // allocates 512 B: 32 KB let ~3 of its groups onto an NVIDIA SM, -34 % GPU time per call
-        // with the fit). `XCL_LDS_FIT=0`: always 32 KB, as before (the `ldsfit` variant still fits).
-        let on = crate::gpu::recomp::lds_fit_enabled() || super::module::variant::current() & super::module::variant::LDSFIT != 0;
-        let fit = match entry {
-            Entry::Compute(cs) if cs.lds_bytes > 0 && on => Some(cs.lds_bytes / 4),
-            // (a mesh shader has 28 KB of groupshared memory: always fitted)
-            Entry::MeshOnePass(m) if m.lds_bytes > 0 => Some(m.lds_bytes / 4),
-            _ => None,
+        // a compute program's LDS allocation (COMPUTE_PGM_RSRC2.LDS_SIZE) sizes the block
+        let lds_bytes = match entry {
+            Entry::Compute(cs) => cs.lds_bytes,
+            // (local) a one-pass mesh shader too: it has 28 KB of groupshared memory, not 32
+            Entry::MeshOnePass(m) => m.lds_bytes,
+            _ => 0,
         };
-        lw.setup_storage(uses_lds, if split { slot } else { 1 }, fit);
+        lw.setup_storage(uses_lds, if split { slot } else { 1 }, lds_bytes);
         if let Entry::MeshOnePass(m) = entry {
-            // what `setup_storage` declared, at most (the split form's exchange words included)
-            let extra = if split { 4 * lw.xslot * lw.waves + 2 * lw.waves + 1 } else { 0 };
-            let words = if uses_lds { fit.map_or(8192, |w| (w.max(1) + extra).min(8192)) } else { extra };
+            // what `setup_storage` declared (the split form's exchange words included)
             if uses_lds && m.lds_bytes == 0 {
                 lw.exchange_error = Some("one-pass mesh shader: the program's LDS size is not known".into());
-            } else if words > 7168 {
-                lw.exchange_error = Some(format!("one-pass mesh shader: {} B of groupshared memory, over 28 KB", 4 * words));
+            } else if uses_lds && lw.lds_words > 7168 {
+                lw.exchange_error = Some(format!("one-pass mesh shader: {} B of groupshared memory, over 28 KB", 4 * lw.lds_words));
             }
         }
         lw
