@@ -41,5 +41,8 @@ resources.pri
 report.json
 frame_*.bmp
 
+# vkd3d-proton (Wine) writes its pipeline cache into the working folder, crates/xcl for cargo test
+vkd3d-proton.cache*
+
 # Python bytecode of the scripts
 __pycache__/
