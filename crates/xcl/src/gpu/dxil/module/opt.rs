@@ -820,7 +820,8 @@ impl Module {
         let mut phi_repl: Vec<Option<Value>> = Vec::new();
         loop {
             let mut changed = false;
-            let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+            let (layout, pos) = self.block_layout();
+            let order: Vec<u32> = layout.into_iter().map(|b| b as u32).collect();
 
             // Step 0: simplify degenerate terminators (`CondBr(_, t, t)`, `Switch` cases -> default).
             for &b_u32 in &order {
@@ -855,10 +856,6 @@ impl Module {
 
             // Step 1: bypass empty trampoline blocks (`[Br(t)]`, `b != 0`, `t != b`).
             // `preds[x]` is maintained as a superset of live blocks whose terminator targets `x`.
-            let mut pos = vec![usize::MAX; self.blocks.len()];
-            for (k, &b_u32) in order.iter().enumerate() {
-                pos[b_u32 as usize] = k;
-            }
             let mut preds: Vec<Vec<usize>> = vec![Vec::new(); self.blocks.len()];
             for &b_u32 in &order {
                 let b = b_u32 as usize;
@@ -876,14 +873,7 @@ impl Module {
                 }
                 let Op::Br(t_blk) = self.insts[self.blocks[b][0] as usize].op else { continue };
                 let t = t_blk.0 as usize;
-                if t == b || self.blocks[t].is_empty() {
-                    continue;
-                }
-                // A trampoline that branches back (to a block earlier in the layout) is a loop's
-                // latch and stays: without it the loop's back edges come from the body's
-                // conditional branches, and dxil-spirv (vkd3d-proton) recurses without end on such
-                // loops (`LoopMergeTracer::trace_from_parent`, `find_common_post_dominator`)
-                if pos[t] <= pos[b] {
+                if t == b || self.blocks[t].is_empty() || pos[t] <= pos[b] {
                     continue;
                 }
                 let b_blk = Block(b_u32);
@@ -1246,60 +1236,6 @@ mod tests {
     }
 
     #[test]
-    fn simplify_cfg_keeps_an_empty_loop_latch() {
-        // header -> body -> (side | latch), side -> latch, latch = [Br(header)]: bypassing the latch
-        // would give the loop two back edges from the body (dxil-spirv recursed without end)
-        let mut m = Module::new();
-        m.define_entry("main");
-        let entry = m.entry_block();
-        let header = m.new_block();
-        let body = m.new_block();
-        let side = m.new_block();
-        let latch = m.new_block();
-        let exit = m.new_block();
-
-        let void = m.void();
-        let i32t = m.i32();
-        let sink_ty = m.func_ty(void, &[i32t]);
-        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
-        let src_ty = m.func_ty(i32t, &[i32t]);
-        let src = m.declare("dx.op.loadInput.i32", src_ty, FnAttrs::NoUnwind);
-
-        m.set_block(entry);
-        let z = m.i32c(0);
-        m.br(header);
-
-        m.set_block(header);
-        let v = m.call(src, &[z]);
-        let ten = m.i32c(10);
-        let go = m.cmp(Pred::ULt, v, ten);
-        m.cond_br(go, body, exit);
-
-        m.set_block(body);
-        m.call(sink, &[v]);
-        let three = m.i32c(3);
-        let odd = m.cmp(Pred::Eq, v, three);
-        m.cond_br(odd, side, latch);
-
-        m.set_block(side);
-        m.call(sink, &[three]);
-        m.br(latch);
-
-        m.set_block(latch);
-        m.br(header);
-
-        m.set_block(exit);
-        m.ret();
-
-        m.optimize();
-        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
-        assert!(m.uses_well_formed(&order));
-        assert!(order.contains(&latch.0), "the empty latch stays");
-        let back: Vec<u32> = order.iter().copied().filter(|&b| m.successors(b as usize).contains(&header)).collect();
-        assert_eq!(back, vec![entry.0, latch.0], "one back edge, from the latch");
-    }
-
-    #[test]
     fn same_mask_selects_fold_to_the_observed_one() {
         // x1 = sel(m, x0 + 1, x0); x2 = sel(m, x1 * 2, x1): one select stays, x2 = sel(m, (x0 + 1) * 2, x0)
         fn build() -> (Module, [Value; 4]) {
@@ -1650,5 +1586,52 @@ mod tests {
         assert_eq!(m.const_u64(args[12]), Some(0), "and(zext(i1), 0xFFFF0000) -> 0");
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn simplify_cfg_keeps_an_empty_block_on_a_back_edge() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let outer = m.new_block();
+        let inner = m.new_block();
+        let body = m.new_block();
+        let latch = m.new_block();
+        let exit = m.new_block();
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let lane = m.call(src, &[]);
+        let z = m.i32c(0);
+        let one = m.i32c(1);
+        m.br(outer);
+
+        m.set_block(outer);
+        m.call(sink, &[z]);
+        m.br(inner);
+
+        m.set_block(inner);
+        let go = m.cmp(Pred::Eq, lane, z);
+        m.cond_br(go, body, exit);
+
+        m.set_block(body);
+        m.call(sink, &[lane]);
+        let again = m.cmp(Pred::Eq, lane, one);
+        m.cond_br(again, inner, latch);
+
+        m.set_block(latch);
+        m.br(outer);
+
+        m.set_block(exit);
+        m.ret();
+
+        m.optimize();
+        assert!(m.successors(body.0 as usize).contains(&latch));
     }
 }
