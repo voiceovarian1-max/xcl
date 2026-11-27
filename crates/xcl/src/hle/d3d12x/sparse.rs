@@ -567,6 +567,19 @@ struct State {
     rb_alloc: ID3D12CommandAllocator,
     rb_list: ID3D12GraphicsCommandList,
     rb_last_fence: u64,
+    /// (local) a COPY queue for the copies back of CPU reads (`rb_list` is a copy list then): a
+    /// DIRECT one shares the 3D engine with the title's work and waited for a time slice there
+    /// (~3 ms a copy back, the state's lock held, the title's submits waiting for it).
+    /// `XCL_READBACK_COPY_QUEUE=1` (runs 225/226: 7.72 / 7.42 fps, readback_now 0.61 / 0.58 ms a
+    /// call against 0.64: no clear gain); default: on `queue`, as before.
+    rbc: Option<(ID3D12CommandQueue, ID3D12Fence)>,
+    rbc_value: u64,
+    /// (local) A copy back for a CPU read that is on the queue and not landed yet: the fence value
+    /// it is done at, the readback memory, the copies (address, offset there, bytes, `TileEntry::gen`
+    /// of its tile then), and for each the hashes its chunks of the title's memory had when it was
+    /// queued (`readback_now` waits for the GPU without the state's lock; whoever needs the
+    /// readback memory next lands it).
+    rb_waiting: Option<(u64, *mut u8, Vec<(usize, usize, usize, u32)>, Vec<Vec<u64>>)>,
     /// the fence value each title queue last waited for
     waited: FxHashMap<usize, u64>,
     /// `mapped` as runs of neighbouring tiles (start -> end), kept with it: sorted out of all of
@@ -1073,8 +1086,14 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
         slots.push(UploadSlot { alloc, list, fence_val: 0 });
     }
-    let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-    let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
+    let rbc = std::env::var("XCL_READBACK_COPY_QUEUE").is_ok_and(|v| v.trim() == "1").then(|| -> windows::core::Result<(ID3D12CommandQueue, ID3D12Fence)> {
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })?;
+        let _ = q.SetName(windows::core::w!("xcl sparse copy-back queue"));
+        Ok((q, dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?))
+    }).and_then(|r| r.ok());
+    let rb_type = if rbc.is_some() { D3D12_COMMAND_LIST_TYPE_COPY } else { D3D12_COMMAND_LIST_TYPE_DIRECT };
+    let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(rb_type)?;
+    let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, rb_type, &rb_alloc, None)?;
     rb_list.Close()?;
     let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
     let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
@@ -1121,6 +1140,9 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         rb_alloc,
         rb_list,
         rb_last_fence: 0,
+        rbc,
+        rbc_value: 0,
+                rb_waiting: None,
         waited: FxHashMap::default(),
         runs: BTreeMap::new(),
         scratch_runs: Vec::new(),
@@ -2109,6 +2131,61 @@ impl State {
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
+        self.readback_ranges_leaving(ranges, false)
+    }
+
+    /// The hashes of the 64-byte chunks of the title's memory `[dst, dst + len)` lies in (0 for a
+    /// page that is not there).
+    unsafe fn chunk_hashes(&self, dst: usize, len: usize) -> Vec<u64> {
+        (dst / CHUNK..=(dst + len - 1) / CHUNK)
+            .map(|c| {
+                let pg = (c * CHUNK) & !(PAGE - 1);
+                let t = pg & !(TILE - 1);
+                // (the bytes are where the tile's CPU view is: `TileEntry::cpu`)
+                match self.mapped.get(&t) {
+                    Some(e) if e.pool != LAZY && e.holes & (1u16 << ((pg - t) / PAGE)) == 0 => chunk_hash(std::slice::from_raw_parts((e.cpu(t) + (c * CHUNK - t)) as *const u8, CHUNK)),
+                    _ => 0,
+                }
+            })
+            .collect()
+    }
+
+    /// Land the copy back that was left on the queue (`rb_waiting`), once the GPU has made it. A
+    /// chunk the CPU has written since the copy was queued keeps its bytes: they are newer, and a
+    /// look may have sent them up already.
+    unsafe fn settle_rb_waiting(&mut self) {
+        let Some((target, p, copies, snaps)) = self.rb_waiting.take() else { return };
+        self.wait_for(target);
+        self.reclaim_ring();
+        for (&(dst, off, len, gen), snap) in copies.iter().zip(&snaps) {
+            let end = dst + len;
+            let first = dst / CHUNK;
+            let mut at = dst;
+            while at < end {
+                let start = at & !(CHUNK - 1);
+                let step = (start + CHUNK).min(end) - at;
+                let pg = at & !(PAGE - 1);
+                let t = pg & !(TILE - 1);
+                let idx = (pg - t) / PAGE;
+                // (as `copy_back`: a tile with no video memory, or whose CPU memory changed
+                // (`TileEntry::gen`), gets nothing; the bytes land at its CPU view)
+                if let Some(entry) = self.mapped.get_mut(&t).filter(|e| e.pool != LAZY) {
+                    let here = entry.cpu(t) + (start - t);
+                    if entry.holes & (1u16 << idx) == 0 && entry.gen == gen && chunk_hash(std::slice::from_raw_parts(here as *const u8, CHUNK)) == snap[start / CHUNK - first] {
+                        std::ptr::copy_nonoverlapping(p.add(off + (at - dst)), (here + (at - start)) as *mut u8, step);
+                        let sent = entry.sent[idx].get_or_insert_with(|| Box::new(ZERO_HASHES));
+                        sent[(start - pg) / CHUNK] = chunk_hash(std::slice::from_raw_parts(here as *const u8, CHUNK));
+                    }
+                }
+                at += step;
+            }
+        }
+    }
+
+    /// `readback_ranges`; with `leave` the last batch of copies is left on the queue
+    /// (`rb_waiting`) for the caller to wait for outside the state's lock.
+    unsafe fn readback_ranges_leaving(&mut self, ranges: &[(usize, usize)], leave: bool) {
+        self.settle_rb_waiting();
         self.flush_pending();
         // copies back of earlier submissions first: their data is older than this one's
         self.drain_readbacks(Drain::TitleDone);
@@ -2116,9 +2193,39 @@ impl State {
         let mut pending: Vec<(usize, usize, usize, u32)> = Vec::new(); // (va, rb_off, chunk, gen of its tile)
         let mut used = 0usize;
         let mut open = false;
-        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize, u32)>, used: &mut usize, p: *mut u8| {
+        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize, u32)>, used: &mut usize, p: *mut u8, leave: bool| {
             if *open {
                 *open = false;
+                if let Some((q, f)) = s.rbc.clone() {
+                    // after what `queue` has (tile mappings, uploads of the CPU's writes), on the
+                    // copy engine; waited for here (no `leave`: the lists are of another type)
+                    if s.rb_list.Close().is_ok() {
+                        if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
+                            // (no signal of its own: one on `queue` waits for a 3D-engine time slice
+                            // too; its tile maps and uploads each end with one, `flush_pending`)
+                            let _ = q.Wait(&s.fence, s.value);
+                            super::title_textures::own_work(|| {
+                                q.ExecuteCommandLists(&[Some(l)]);
+                            });
+                        }
+                    }
+                    s.rbc_value += 1;
+                    let v = s.rbc_value;
+                    if q.Signal(&f, v).is_ok() {
+                        let t0 = std::time::Instant::now();
+                        while super::real::fence_completed(&f) < v && t0.elapsed().as_millis() < 5000 {
+                            let _ = f.SetEventOnCompletion(v, s.event);
+                            windows::Win32::System::Threading::WaitForSingleObject(s.event, 100);
+                        }
+                    }
+                    s.reclaim_ring();
+                    for &(dst, off, len, gen) in pending.iter() {
+                        s.copy_back(p, dst, off, len, gen);
+                    }
+                    pending.clear();
+                    *used = 0;
+                    return;
+                }
                 if s.rb_list.Close().is_ok() {
                     if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
                         super::title_textures::own_work(|| {
@@ -2128,6 +2235,13 @@ impl State {
                 }
                 s.signal();
                 s.rb_last_fence = s.value;
+                if leave {
+                    let copies = std::mem::take(pending);
+                    let snaps = copies.iter().map(|&(dst, _, len, _)| s.chunk_hashes(dst, len)).collect();
+                    s.rb_waiting = Some((s.value, p, copies, snaps));
+                    *used = 0;
+                    return;
+                }
                 s.wait_for(s.value);
                 s.reclaim_ring();
             }
@@ -2155,7 +2269,7 @@ impl State {
                     continue;
                 };
                 if used == READBACK_STAGING {
-                    flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+                    flush_and_copy(self, &mut open, &mut pending, &mut used, p, false);
                 }
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
@@ -2172,7 +2286,7 @@ impl State {
             }
         }
         if open {
-            flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+            flush_and_copy(self, &mut open, &mut pending, &mut used, p, leave);
         }
     }
 
@@ -2552,6 +2666,19 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
         HELD.add(HELD_AFTER_WAIT, t0.elapsed().as_micros() as u64);
     }
     let Some(s) = g.as_mut() else { return };
+    // (local) `XCL_READBACK_LIST_ALWAYS=0`: with the readback queue these come back by themselves
+    // once the lists are done (the copies below), not marked for every later read to copy them
+    // back again (run 223: no gain, 7.39 fps; the reads that copy are of shader-written memory).
+    // (GPU_WRITES is taken under STATE here; nothing takes STATE under GPU_WRITES.)
+    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if s.rbq.is_none() || *ALWAYS.get_or_init(|| std::env::var("XCL_READBACK_LIST_ALWAYS").map_or(true, |v| v.trim() != "0")) {
+        for &(a, n) in ranges {
+            note_gpu_writable(a, n);
+        }
+        for &(a, _, _) in imms {
+            note_gpu_writable(a, 8);
+        }
+    }
     s.note_queue(queue);
     s.after_execute(queue, ranges, imms);
 }
@@ -2704,13 +2831,169 @@ impl State {
     }
 }
 
+/// (local) What the GPU can have written in title memory, for CPU reads (`readback_now`).
+/// `always`: 64 KiB tiles an unordered-access view was made of or a GPU memory write named – a
+/// shader can write them in any submit, so every read copies them back. `copies`: ranges a
+/// submitted list copies into (buffer copies, texture-to-buffer copies, query resolves), each
+/// with its queue and submit; one is copied back once, after its submit has finished.
+/// Of 65,536 copies back in a retail game's world 62,107 changed no byte, and 55,000 were single
+/// 8-byte query results, each a GPU round trip under the state's lock.
+#[derive(Default)]
+struct GpuWrites {
+    always: std::collections::HashSet<usize>,
+    copies: Vec<(usize, usize, usize, u64)>,
+}
+
+static GPU_WRITES: Mutex<Option<GpuWrites>> = Mutex::new(None);
+
+fn tiles(va: usize, len: usize) -> std::ops::RangeInclusive<usize> {
+    va / TILE..=(va + len.max(1) - 1) / TILE
+}
+
+/// A shader can write `[va, va + len)` from now on.
+pub fn note_gpu_writable(va: usize, len: usize) {
+    if va == 0 || len == 0 {
+        return;
+    }
+    GPU_WRITES.lock().unwrap().get_or_insert_with(Default::default).always.extend(tiles(va, len));
+}
+
+/// A list submitted to `queue` as its submit number `submit` copies into `[va, va + len)`.
+pub fn note_gpu_copy(va: usize, len: usize, queue: usize, submit: u64) {
+    if va == 0 || len == 0 {
+        return;
+    }
+    let mut g = GPU_WRITES.lock().unwrap();
+    let w = g.get_or_insert_with(Default::default);
+    // shortcut: more waiting copies than this are not kept apart, their tiles are copied back at
+    // every read from then on; upgrade if a title never reads what it has copied.
+    if w.copies.len() >= 16384 {
+        let old = std::mem::take(&mut w.copies);
+        for (a, n, _, _) in old {
+            w.always.extend(tiles(a, n));
+        }
+    }
+    w.copies.push((va, len, queue, submit));
+}
+
+/// For a CPU read of `[va, va + len)`: None – nothing the GPU wrote there waits to be copied
+/// back. Some(ranges): what to copy back now – the range itself when a shader can write it or a
+/// copy into it has not finished, and every finished copy that waits (taken off the list).
+fn reads_to_copy_back(va: usize, len: usize) -> Option<Vec<(usize, usize)>> {
+    let mut g = GPU_WRITES.lock().unwrap();
+    let w = g.get_or_insert_with(Default::default);
+    let overlaps = |a: usize, n: usize| a < va + len && va < a + n;
+    let always = tiles(va, len).any(|t| w.always.contains(&t));
+    if !always && !w.copies.iter().any(|&(a, n, _, _)| overlaps(a, n)) {
+        return None;
+    }
+    let mut done: HashMap<(usize, u64), bool> = HashMap::new();
+    let mut out = Vec::new();
+    let mut unfinished_here = false;
+    w.copies.retain(|&(a, n, q, i)| {
+        if *done.entry((q, i)).or_insert_with(|| super::list_x::submit_done(q, i)) {
+            out.push((a, n));
+            false
+        } else {
+            unfinished_here |= overlaps(a, n);
+            true
+        }
+    });
+    if always || unfinished_here || out.is_empty() {
+        out.push((va, len));
+    }
+    Some(out)
+}
+
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
 /// tile clears and unsubmitted CPU-changed chunks first so CPU writes are preserved, then
 /// copies the range back from VRAM into CPU memory.
 pub unsafe fn readback_now(va: usize, len: usize) {
+    let _cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::ReadbackNow);
     if len == 0 {
         return;
+    }
+    // (local diagnostic) `XCL_READBACK_SKIP=all`: no copy back at all – an upper bound of what the
+    // copies cost; the title reads what memory held (stale GPU results)
+    static NONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NONE.get_or_init(|| std::env::var("XCL_READBACK_SKIP").is_ok_and(|v| v.trim() == "all")) {
+        return;
+    }
+    // (local) A range copied back while every title queue was idle needs no second copy until a
+    // queue is given work again: the GPU has run nothing since, video memory holds what it held.
+    // A retail game's world maps the same ranges some 750 times a second, each copy a GPU round
+    // trip (~1 ms) under the state's lock. `XCL_READBACK_SKIP=0`: every Map copies, as before.
+    static COPIED_AT: Mutex<Option<HashMap<(usize, usize), u64>>> = Mutex::new(None);
+    // `XCL_READBACK_WRITABLE_ONLY=1`: only what the GPU is known to have written is copied back
+    // (`GpuWrites`); without it every read copies its range, as before.
+    static WRITABLE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let tracked = *WRITABLE_ONLY.get_or_init(|| std::env::var("XCL_READBACK_WRITABLE_ONLY").is_ok_and(|v| v.trim() == "1"));
+    // (local) only `XCL_READBACK_STATS=1` reads it: a lock and a scan of up to 16 Ki copies a call
+    static STATS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let writable = *STATS_ON.get_or_init(|| std::env::var("XCL_READBACK_STATS").is_ok_and(|v| v.trim() == "1"))
+        && GPU_WRITES.lock().unwrap().as_ref().is_some_and(|w| tiles(va, len).any(|t| w.always.contains(&t)) || w.copies.iter().any(|&(a, n, _, _)| a < va + len && va < a + n));
+    let ranges: Vec<(usize, usize)> = if tracked {
+        match reads_to_copy_back(va, len) {
+            Some(r) => r,
+            None => {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() && n >= 1024 {
+                    crate::xlog_info!("sparse: {n} CPU reads so far of memory the GPU had written nothing new in (no copy back)");
+                }
+                // (local) what the lists wrote lands with the readback queue's copies: those done
+                // are taken now (`readback_after_execute`)
+                settle_readbacks_within(1);
+                return;
+            }
+        }
+    } else {
+        vec![(va, len)]
+    };
+    // (local) `XCL_READBACK_SKIP=done`: not copied again until one of the title's submits has
+    // finished since (run 217: no gain, the title's submits finish all the time: 7.12 fps vs 7.66);
+    // default: until every queue was idle again; `0`: every Map copies
+    static SKIP_MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *SKIP_MODE.get_or_init(|| match std::env::var("XCL_READBACK_SKIP").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("done") => 2,
+        _ => 1,
+    });
+    let idle_at = match mode {
+        0 => None,
+        1 => super::list_x::idle_submit_count(),
+        _ => Some(super::list_x::done_submit_count()),
+    };
+    // (local) `XCL_READBACK_REUSE_MS=N`: a range copied back less than N ms ago is not copied
+    // again – the title reads GPU results at most N ms old (the world reads the same ranges
+    // ~2,000 times a second, each copy a GPU round trip under the state's lock; with no copies
+    // at all the world ran 8.1 fps instead of ~7.5, run 230)
+    static REUSE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static COPIED_WHEN: Mutex<Option<HashMap<(usize, usize), std::time::Instant>>> = Mutex::new(None);
+    let reuse = *REUSE_MS.get_or_init(|| std::env::var("XCL_READBACK_REUSE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if reuse > 0 {
+        let mut g = COPIED_WHEN.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        let now = std::time::Instant::now();
+        if m.get(&(va, len)).is_some_and(|t| now.duration_since(*t).as_millis() < reuse as u128) {
+            return;
+        }
+        if m.len() >= 16384 {
+            m.clear();
+        }
+        // (the time the copy starts: what it brings is at least this new)
+        m.insert((va, len), now);
+    }
+    if let Some(at) = idle_at {
+        if COPIED_AT.lock().unwrap().as_ref().and_then(|m| m.get(&(va, len))) == Some(&at) {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() && n >= 1024 {
+                crate::xlog_info!("sparse: {n} copies back for a CPU read left out so far (no GPU work since the range's last one)");
+            }
+            return;
+        }
     }
     let mut g = lock_state();
     let _held = holding(Holder::CpuRead);
@@ -2725,31 +3008,106 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         }
         s.upload_zeros(&zeroed);
     }
-    // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
+    // Preserve any unsubmitted CPU writes on pages overlapping the ranges
     let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
-    let mut pg = va & !(PAGE - 1);
-    let end = va + len;
-    while pg < end {
-        let t = pg & !(TILE - 1);
-        let tile_end = (t + TILE).min(end);
-        if let Some(entry) = s.mapped.get_mut(&t) {
-            let cpu = entry.cpu(t);
-            let mut p = pg;
-            while p < tile_end {
-                let idx = (p - t) / PAGE;
-                if entry.holes & (1u16 << idx) == 0 {
-                    let bytes = std::slice::from_raw_parts((cpu + (p - t)) as *const u8, PAGE);
-                    scan_page(bytes, p, &mut entry.sent[idx], &mut dirty_runs);
+    for &(va, len) in &ranges {
+        let mut pg = va & !(PAGE - 1);
+        let end = va + len;
+        while pg < end {
+            let t = pg & !(TILE - 1);
+            let tile_end = (t + TILE).min(end);
+            if let Some(entry) = s.mapped.get_mut(&t) {
+                let cpu = entry.cpu(t);
+                let mut p = pg;
+                while p < tile_end {
+                    let idx = (p - t) / PAGE;
+                    if entry.holes & (1u16 << idx) == 0 {
+                        let bytes = std::slice::from_raw_parts((cpu + (p - t)) as *const u8, PAGE);
+                        scan_page(bytes, p, &mut entry.sent[idx], &mut dirty_runs);
+                    }
+                    p += PAGE;
                 }
-                p += PAGE;
             }
+            pg = tile_end;
         }
-        pg = tile_end;
     }
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
-    s.readback_ranges(&[(va, len)]);
+    // (local diagnostic) `XCL_READBACK_STATS=1`: how many of these copies changed the bytes the CPU
+    // had (a sum of the range's words before and after), by size
+    static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // (a tile of a GPU view has no CPU memory at its own address: `TileEntry::src`)
+    let stats = *STATS.get_or_init(|| std::env::var("XCL_READBACK_STATS").is_ok_and(|v| v.trim() == "1")) && len <= 4 << 20 && s.mapped.get(&(va & !(TILE - 1))).is_some_and(|e| e.src == 0);
+    let sum = |a: usize, n: usize| (0..n / 8).fold(0u64, |h, i| h.wrapping_mul(31).wrapping_add(((a + i * 8) as *const u64).read_unaligned()));
+    let before = if stats { sum(va, len) } else { 0 };
+    // (local experiment) `XCL_READBACK_UNLOCKED=1`: the wait for the GPU is outside the state's
+    // lock, so the title's submits go on meanwhile (the lock was held ~3 ms a read, 300-450 reads
+    // a second). Off by default: the one run with it (149) cut the submit path's lock wait from
+    // 2.4-5.4 ms to 0.33 ms a submit, gave no more frames, and the title crashed at 154 s.
+    static UNLOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let leave = !stats && *UNLOCKED.get_or_init(|| std::env::var("XCL_READBACK_UNLOCKED").is_ok_and(|v| v.trim() == "1"));
+    s.readback_ranges_leaving(&ranges, leave);
+    let waiting = s.rb_waiting.as_ref().map(|w| (w.0, s.fence.clone()));
+    if stats {
+        static N: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+        static UNSEEN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+        let changed = sum(va, len) != before;
+        // (what the GPU changed outside the memory it is known to write: the copies a skip would lose)
+        UNSEEN[if writable { 0 } else if changed { 2 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+        if changed && !writable && UNSEEN[2].load(Ordering::Relaxed) <= 24 {
+            crate::xlog_info!("sparse: a copy back changed {len:#x} bytes at {va:#x} that no unordered-access view or GPU memory write named");
+        }
+        let size = match len {
+            0..=4096 => 0,
+            4097..=65536 => 1,
+            65537..=1048576 => 2,
+            _ => 3,
+        };
+        N[size * 2 + changed as usize].fetch_add(1, Ordering::Relaxed);
+        let all: Vec<u64> = N.iter().map(|n| n.load(Ordering::Relaxed)).collect();
+        let total: u64 = all.iter().sum();
+        if total.is_power_of_two() && total >= 1024 {
+            crate::xlog_info!(
+                "sparse: copies back for a CPU read so far, same / changed bytes: up to 4 KiB {} / {}, to 64 KiB {} / {}, to 1 MiB {} / {}, larger {} / {}",
+                all[0], all[1], all[2], all[3], all[4], all[5], all[6], all[7]
+            );
+            crate::xlog_info!(
+                "sparse: of them in memory the GPU is known to write {}, elsewhere {} unchanged and {} changed",
+                UNSEEN[0].load(Ordering::Relaxed), UNSEEN[1].load(Ordering::Relaxed), UNSEEN[2].load(Ordering::Relaxed)
+            );
+        }
+    }
+    drop(g);
+    if let Some((target, fence)) = waiting {
+        thread_local! {
+            static EVENT: HANDLE = unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None).unwrap_or_default() };
+        }
+        let t0 = std::time::Instant::now();
+        while super::real::fence_completed(&fence) < target && t0.elapsed().as_millis() < 5000 {
+            EVENT.with(|&e| {
+                if e.is_invalid() || fence.SetEventOnCompletion(target, e).is_err() {
+                    std::thread::yield_now();
+                } else {
+                    windows::Win32::System::Threading::WaitForSingleObject(e, 100);
+                }
+            });
+        }
+        let mut g = lock_state();
+        if let Some(s) = g.as_mut() {
+            if s.rb_waiting.as_ref().is_some_and(|w| w.0 == target) {
+                s.settle_rb_waiting();
+            }
+        }
+    }
+    if let Some(at) = idle_at {
+        let mut m = COPIED_AT.lock().unwrap();
+        let m = m.get_or_insert_with(HashMap::new);
+        if m.len() >= 16384 {
+            m.clear();
+        }
+        m.insert((va, len), at);
+    }
 }
 
 /// Submits waiting for the state's lock. A thread that takes it again and again – a title mapping
@@ -5173,6 +5531,9 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+                rbc: None,
+                rbc_value: 0,
+                rb_waiting: None,
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
@@ -5504,6 +5865,9 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+                rbc: None,
+                rbc_value: 0,
+                rb_waiting: None,
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
@@ -5741,6 +6105,9 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+                rbc: None,
+                rbc_value: 0,
+                rb_waiting: None,
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
@@ -5879,6 +6246,9 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+                rbc: None,
+                rbc_value: 0,
+                rb_waiting: None,
                 waited: FxHashMap::default(),
                 runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),

@@ -3045,9 +3045,11 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let uav_start = va.saturating_add(b.FirstElement.saturating_mul(elem as u64)) as usize;
         let uav_bytes = (b.NumElements as u64).saturating_mul(elem as u64) as usize;
         super::sparse::ensure_lazy_mapped(uav_start, uav_bytes);
+        super::sparse::note_gpu_writable(uav_start, uav_bytes);
         let counter = (view.add(0x30) as *const u64).read_unaligned();
         if counter != 0 {
             super::sparse::ensure_lazy_mapped(counter as usize, 4);
+            super::sparse::note_gpu_writable(counter as usize, 4);
         }
         return super::console_heap::write(&slot, &words);
     }
@@ -3353,10 +3355,21 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         return super::console_heap::write(&slot, &[0; 8]);
     };
     let rd = rd_opt.unwrap();
-    if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-        let b = &v.Anonymous.Buffer;
-        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+    if desc.as_ref().map_or(rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER, |v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        let (format, first, n, stride, raw) = match desc.as_ref() {
+            Some(v) => {
+                let b = &v.Anonymous.Buffer;
+                (v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0)
+            }
+            None => (rd.Format, 0, (rd.Width / 4) as u32, 0, true),
+        };
+        // (the whole buffer, and its counter's: what this view lets the GPU write)
+        for r in [res, counter] {
+            if let Some((p, bytes)) = console_buffer(r as usize) {
+                super::sparse::note_gpu_writable(p, bytes);
+            }
+        }
+        return super::console_heap::write(&slot, &buffer_view(res as usize, format, first, n, stride, raw));
     }
     // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
     let (format, dim, array, mip) = match desc.as_ref() {

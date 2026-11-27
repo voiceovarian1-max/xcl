@@ -1168,12 +1168,54 @@ fn note_write(list: usize, va: u64, size: u64) {
     recording(list).lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
+/// (local) list → the buffer ranges its copies and query resolves write, and whether it has been
+/// submitted since the last of them was noted.
+static COPY_DESTS: Mutex<Option<HashMap<usize, (Vec<(usize, usize)>, bool)>>> = Mutex::new(None);
+
+/// `lists` go to `queue` now (before `note_submitted` counts the submit): their copies into
+/// buffers wait to be copied back for the CPU once that submit has finished.
+unsafe fn copies_submitted(queue: *mut c_void, lists: &[*mut c_void]) {
+    let mut g = COPY_DESTS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    let submit = PROGRESS.lock().unwrap().as_ref().and_then(|p| p.get(&(queue as usize))).map_or(1, |p| p.submitted + 1);
+    for &l in lists {
+        if let Some(e) = m.get_mut(&(l as usize)) {
+            e.1 = true;
+            for &(a, n) in &e.0 {
+                super::sparse::note_gpu_copy(a, n, queue as usize, submit);
+            }
+        }
+    }
+}
+
+/// Whether `queue`'s submit number `submit` has finished on the GPU.
+pub(super) fn submit_done(queue: usize, submit: u64) -> bool {
+    PROGRESS.lock().unwrap().as_ref().and_then(|p| p.get(&queue)).is_some_and(|p| unsafe { real::fence_completed(&p.fence) } >= submit)
+}
+
 /// A PC copy into `[offset, offset + n)` of console buffer `dst` whose memory the GPU only has
 /// a copy of in a committed window (`Uma::shadowed`: readback buffers live there, and titles
 /// read them through a pointer they keep mapped, without another Map), or placed in a GPU view
 /// (what the GPU writes there is its tiles', and the title reads it at the CPU view): the bytes
 /// come back to the CPU's view after the submit, like the lists' own memory writes.
 fn note_copy_into(list: usize, dst: usize, offset: u64, n: u64) {
+    // (local) what this list copies into: told to `sparse` when the list is submitted (`copies_submitted`)
+    if let Some((p, bytes)) = real::console_buffer(dst) {
+        let at = offset.min(bytes as u64) as usize;
+        let range = (p + at, n.min((bytes - at) as u64) as usize);
+        let mut g = COPY_DESTS.lock().unwrap();
+        let e = g.get_or_insert_with(HashMap::new).entry(list).or_default();
+        // (recorded anew after a submit: the ranges of the recording before are done with)
+        if e.1 {
+            e.0.clear();
+            e.1 = false;
+        }
+        if e.0.len() < 4096 {
+            e.0.push(range);
+        } else {
+            super::sparse::note_gpu_writable(range.0, range.1);
+        }
+    }
     let Some(u) = crate::gpu::uma::get().filter(|u| u.shadowed() || super::bind::view_span().1 != 0) else { return };
     let Some((p, bytes)) = real::console_buffer(dst).filter(|&(p, _)| (u.shadowed() && u.is_committed(p)) || u.is_view(p)) else { return };
     let offset = offset.min(bytes as u64);
@@ -1369,6 +1411,27 @@ pub(super) unsafe fn note_submitted(queue: *mut c_void) {
             p.recent.pop_front();
         }
     }
+}
+
+/// How many submits the title's queues have had in all, when every one of them has finished
+/// (None: a queue is still at work). Two equal answers: the GPU ran nothing in between.
+pub(super) fn idle_submit_count() -> Option<u64> {
+    let g = PROGRESS.lock().unwrap();
+    let mut n = 0u64;
+    for p in g.iter().flat_map(|m| m.values()) {
+        if unsafe { super::real::fence_completed(&p.fence) } < p.submitted {
+            return None;
+        }
+        n += p.submitted;
+    }
+    Some(n)
+}
+
+/// (local) How many of the title's submits have finished in all, over its queues: it changes
+/// whenever one does (`sparse::readback_now`).
+pub(super) fn done_submit_count() -> u64 {
+    let g = PROGRESS.lock().unwrap();
+    g.iter().flat_map(|m| m.values()).map(|p| unsafe { super::real::fence_completed(&p.fence) }.min(p.submitted)).sum()
 }
 
 /// `q<id> <done>/<submitted> submits (oldest unfinished for <ms> ms)` for every queue behind.
@@ -2431,6 +2494,9 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
 /// Copy any GPU memory writes into sparse VRAM windows recorded by `lists` back into their
 /// CPU view after `queue.ExecuteCommandLists` so CPU reads and `Wait32/64BitValueX` see them.
 pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_void]) {
+    if !queue.is_null() {
+        copies_submitted(queue, lists);
+    }
     if SPARSE_WRITE_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
         return;
     }

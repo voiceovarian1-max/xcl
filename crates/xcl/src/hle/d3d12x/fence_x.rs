@@ -66,7 +66,11 @@ fn refresh() {
     // what the lists wrote into the title's memory lands before the values that say they are done
     // (the title reads a cell and then the memory: the cell is no promise of the hooked
     // GetCompletedValue, which lands it as well). Not with FENCES held: see `note_queue_signal`.
-    unsafe { super::sparse::settle_readbacks_within(20) };
+    // (local) `XCL_FENCE_SETTLE_MS` (default 20): how long the state's lock is tried for that. A
+    // copy back for a CPU read holds it ~3 ms across a GPU wait, and the title waits on these values
+    static SETTLE_MS: OnceLock<u64> = OnceLock::new();
+    let ms = *SETTLE_MS.get_or_init(|| std::env::var("XCL_FENCE_SETTLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20));
+    unsafe { super::sparse::settle_readbacks_within(ms) };
     for (c, v) in values {
         c.0.store(v, Ordering::Release);
     }
